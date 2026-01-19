@@ -24,6 +24,8 @@ import (
 	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/config/types"
 	"github.com/docker/cagent/pkg/hooks"
+	"github.com/docker/cagent/pkg/model/provider"
+	"github.com/docker/cagent/pkg/model/provider/options"
 	"github.com/docker/cagent/pkg/modelsdev"
 	"github.com/docker/cagent/pkg/permissions"
 	"github.com/docker/cagent/pkg/rag"
@@ -90,12 +92,12 @@ type ElicitationRequestHandler func(ctx context.Context, message string, schema 
 
 // Runtime defines the contract for runtime execution
 type Runtime interface {
+	// CurrentAgentInfo returns information about the currently active agent
+	CurrentAgentInfo(ctx context.Context) CurrentAgentInfo
 	// CurrentAgentName returns the name of the currently active agent
 	CurrentAgentName() string
 	// SetCurrentAgent sets the currently active agent for subsequent user messages
 	SetCurrentAgent(agentName string) error
-	// CurrentAgentCommands returns the commands for the active agent
-	CurrentAgentCommands(ctx context.Context) types.Commands
 	// CurrentAgentTools returns the tools for the active agent
 	CurrentAgentTools(ctx context.Context) ([]tools.Tool, error)
 	// EmitStartupInfo emits initial agent, team, and toolset information for immediate display
@@ -116,6 +118,12 @@ type Runtime interface {
 
 	// Summarize generates a summary for the session
 	Summarize(ctx context.Context, sess *session.Session, additionalPrompt string, events chan Event)
+}
+
+type CurrentAgentInfo struct {
+	Name        string
+	Description string
+	Commands    types.Commands
 }
 
 type ModelStore interface {
@@ -372,6 +380,16 @@ func (r *LocalRuntime) CurrentAgentName() string {
 	return r.currentAgent
 }
 
+func (r *LocalRuntime) CurrentAgentInfo(context.Context) CurrentAgentInfo {
+	currentAgent := r.CurrentAgent()
+
+	return CurrentAgentInfo{
+		Name:        currentAgent.Name(),
+		Description: currentAgent.Description(),
+		Commands:    currentAgent.Commands(),
+	}
+}
+
 func (r *LocalRuntime) SetCurrentAgent(agentName string) error {
 	// Validate that the agent exists in the team
 	if _, err := r.team.Agent(agentName); err != nil {
@@ -482,6 +500,22 @@ func getAgentModelID(a *agent.Agent) string {
 	return ""
 }
 
+// isModelThinkingDisabled checks if the model's thinking configuration is explicitly disabled
+// (thinking_budget: 0 or thinking_budget: none).
+func isModelThinkingDisabled(model provider.Provider) bool {
+	if model == nil {
+		return false
+	}
+	tb := model.BaseConfig().ModelConfig.ThinkingBudget
+	if tb == nil {
+		return false
+	}
+	if tb.Effort == "none" {
+		return true
+	}
+	return tb.Tokens == 0 && tb.Effort == ""
+}
+
 // agentDetailsFromTeam converts team agent info to AgentDetails for events
 func (r *LocalRuntime) agentDetailsFromTeam() []AgentDetails {
 	agentsInfo := r.team.AgentsInfo()
@@ -492,6 +526,7 @@ func (r *LocalRuntime) agentDetailsFromTeam() []AgentDetails {
 			Description: info.Description,
 			Provider:    info.Provider,
 			Model:       info.Model,
+			Commands:    info.Commands,
 		}
 	}
 	return details
@@ -668,7 +703,8 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 		r.registerDefaultTools()
 
 		if sess.Title == "" {
-			r.titleGen.Generate(ctx, sess, events)
+			userMessage := sess.GetLastUserMessageContent()
+			r.titleGen.Generate(ctx, sess, userMessage, events)
 		}
 
 		iteration := 0
@@ -731,6 +767,19 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 			))
 
 			model := a.Model()
+
+			// If thinking is disabled for this session, clone the provider with thinking disabled
+			if !sess.Thinking {
+				model = provider.CloneWithOptions(ctx, model, options.WithThinking(false))
+				slog.Debug("Cloned provider with thinking disabled", "agent", a.Name(), "model", model.ID())
+			} else if isModelThinkingDisabled(model) {
+				// If thinking is enabled for this session but the model config has it disabled
+				// (e.g., thinking_budget: 0 or thinking_budget: none), clone with explicit enable
+				// so that applyOverrides restores provider defaults.
+				model = provider.CloneWithOptions(ctx, model, options.WithThinking(true))
+				slog.Debug("Cloned provider with thinking enabled (restoring defaults)", "agent", a.Name(), "model", model.ID())
+			}
+
 			modelID := model.ID()
 			slog.Debug("Using agent", "agent", a.Name(), "model", modelID)
 			slog.Debug("Getting model definition", "model_id", modelID)
@@ -795,6 +844,7 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 			// Add assistant message to conversation history, but skip empty assistant messages
 			// Providers reject assistant messages that have neither content nor tool calls.
+			var msgUsage *MessageUsage
 			if strings.TrimSpace(res.Content) != "" || len(res.Calls) > 0 {
 				// Build tool definitions for the tool calls
 				var toolDefs []tools.Tool
@@ -839,6 +889,15 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 					Cost:              messageCost,
 				}
 
+				// Build per-message usage for the event
+				if res.Usage != nil {
+					msgUsage = &MessageUsage{
+						Usage: *res.Usage,
+						Cost:  messageCost,
+						Model: messageModel,
+					}
+				}
+
 				sess.AddMessage(session.NewAgentMessage(a, &assistantMessage))
 				r.saveSession(ctx, sess)
 				slog.Debug("Added assistant message to session", "agent", a.Name(), "total_messages", len(sess.GetAllMessages()))
@@ -846,7 +905,7 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				slog.Debug("Skipping empty assistant message (no content and no tool calls)", "agent", a.Name())
 			}
 
-			events <- TokenUsage(sess.ID, r.currentAgent, sess.InputTokens, sess.OutputTokens, sess.InputTokens+sess.OutputTokens, contextLimit, sess.Cost)
+			events <- TokenUsageWithMessage(sess.ID, r.currentAgent, sess.InputTokens, sess.OutputTokens, sess.InputTokens+sess.OutputTokens, contextLimit, sess.Cost, msgUsage)
 
 			r.processToolCalls(ctx, sess, res.Calls, agentTools, events)
 
@@ -976,8 +1035,13 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	var actualModelEventEmitted bool
 	var messageUsage *chat.Usage
 	modelID := getAgentModelID(a)
-	// Track which tool call indices we've already emitted partial events for
-	emittedPartialEvents := make(map[string]bool)
+
+	toolCallIndex := make(map[string]int)   // toolCallID -> index in toolCalls slice
+	emittedPartial := make(map[string]bool) // toolCallID -> whether we've emitted a partial event
+	toolDefMap := make(map[string]tools.Tool, len(agentTools))
+	for _, t := range agentTools {
+		toolDefMap[t.Name] = t
+	}
 
 	for {
 		response, err := stream.Recv()
@@ -1024,8 +1088,14 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		if actualModel == "" && response.Model != "" {
 			actualModel = response.Model
 			if !actualModelEventEmitted && actualModel != modelID {
-				slog.Debug("Detected actual model differs from configured model (streaming)", "configured", modelID, "actual", actualModel)
-				events <- AgentInfo(a.Name(), actualModel, a.Description(), a.WelcomeMessage())
+				// NOTE(krissetto):Prepend the provider from the configured modelID to maintain consistent format
+				// every other invocation in the code uses the provider/model format
+				formattedModel := actualModel
+				if idx := strings.Index(modelID, "/"); idx != -1 {
+					formattedModel = modelID[:idx+1] + actualModel
+				}
+				slog.Debug("Detected actual model differs from configured model (streaming)", "configured", modelID, "actual", formattedModel)
+				events <- AgentInfo(a.Name(), formattedModel, a.Description(), a.WelcomeMessage())
 				actualModelEventEmitted = true
 			}
 		}
@@ -1046,63 +1116,39 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		// Handle tool calls
 		if len(choice.Delta.ToolCalls) > 0 {
 			// Process each tool call delta
-			for _, deltaToolCall := range choice.Delta.ToolCalls {
-				// Find existing tool call by ID, or create a new one
-				idx := -1
-				for i, toolCall := range toolCalls {
-					if toolCall.ID == deltaToolCall.ID {
-						idx = i
-						break
-					}
-				}
-
-				// If tool call doesn't exist yet, append it
-				if idx == -1 {
+			for _, delta := range choice.Delta.ToolCalls {
+				idx, exists := toolCallIndex[delta.ID]
+				if !exists {
 					idx = len(toolCalls)
+					toolCallIndex[delta.ID] = idx
 					toolCalls = append(toolCalls, tools.ToolCall{
-						ID:   deltaToolCall.ID,
-						Type: deltaToolCall.Type,
+						ID:   delta.ID,
+						Type: delta.Type,
 					})
 				}
 
-				// Check if we should emit a partial event for this tool call
-				// We want to emit when we first get the function name
-				shouldEmitPartial := !emittedPartialEvents[deltaToolCall.ID] &&
-					deltaToolCall.Function.Name != "" &&
-					toolCalls[idx].Function.Name == "" // Don't emit if we already have the name
+				tc := &toolCalls[idx]
 
-				// Update fields based on what's in the delta
-				if deltaToolCall.ID != "" {
-					toolCalls[idx].ID = deltaToolCall.ID
+				// Track if we're learning the name for the first time
+				learningName := delta.Function.Name != "" && tc.Function.Name == ""
+
+				// Update fields from delta
+				if delta.Type != "" {
+					tc.Type = delta.Type
 				}
-				if deltaToolCall.Type != "" {
-					toolCalls[idx].Type = deltaToolCall.Type
+				if delta.Function.Name != "" {
+					tc.Function.Name = delta.Function.Name
 				}
-				if deltaToolCall.Function.Name != "" {
-					toolCalls[idx].Function.Name = deltaToolCall.Function.Name
-				}
-				if deltaToolCall.Function.Arguments != "" {
-					if toolCalls[idx].Function.Arguments == "" {
-						toolCalls[idx].Function.Arguments = deltaToolCall.Function.Arguments
-					} else {
-						toolCalls[idx].Function.Arguments += deltaToolCall.Function.Arguments
-					}
-					// Emit if we get more arguments
-					shouldEmitPartial = true
+				if delta.Function.Arguments != "" {
+					tc.Function.Arguments += delta.Function.Arguments
 				}
 
-				// Emit PartialToolCallEvent when we first get the function name
-				if shouldEmitPartial {
-					// TODO: clean this up, it's gross
-					tool := tools.Tool{}
-					for _, t := range agentTools {
-						if t.Name == toolCalls[idx].Function.Name {
-							tool = t
-							break
-						}
+				// Emit PartialToolCall once we have a name, and on subsequent argument deltas
+				if tc.Function.Name != "" && (learningName || delta.Function.Arguments != "") {
+					if !emittedPartial[delta.ID] || delta.Function.Arguments != "" {
+						events <- PartialToolCall(*tc, toolDefMap[tc.Function.Name], a.Name())
+						emittedPartial[delta.ID] = true
 					}
-					events <- PartialToolCall(toolCalls[idx], tool, a.Name())
-					emittedPartialEvents[deltaToolCall.ID] = true
 				}
 			}
 			continue
@@ -1583,7 +1629,7 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 		memberAgentTask += fmt.Sprintf("\n\n<expected_output>\n%s\n</expected_output>", params.ExpectedOutput)
 	}
 
-	slog.Debug("Creating new session with parent session", "parent_session_id", sess.ID, "tools_approved", sess.ToolsApproved)
+	slog.Debug("Creating new session with parent session", "parent_session_id", sess.ID, "tools_approved", sess.ToolsApproved, "thinking", sess.Thinking)
 
 	child, err := r.team.Agent(params.Agent)
 	if err != nil {
@@ -1596,6 +1642,7 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 		session.WithMaxIterations(child.MaxIterations()),
 		session.WithTitle("Transferred task"),
 		session.WithToolsApproved(sess.ToolsApproved),
+		session.WithThinking(sess.Thinking),
 		session.WithSendUserMessage(false),
 		session.WithParentID(sess.ID),
 	)
@@ -1610,6 +1657,7 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 	}
 
 	sess.ToolsApproved = s.ToolsApproved
+	sess.Thinking = s.Thinking
 
 	sess.AddSubSession(s)
 
@@ -1699,11 +1747,11 @@ func (r *LocalRuntime) elicitationHandler(ctx context.Context, req *mcp.ElicitPa
 		return tools.ElicitationResult{}, fmt.Errorf("no events channel available for elicitation")
 	}
 
-	slog.Debug("Sending elicitation request event to client", "message", req.Message, "requested_schema", req.RequestedSchema)
+	slog.Debug("Sending elicitation request event to client", "message", req.Message, "mode", req.Mode, "requested_schema", req.RequestedSchema, "url", req.URL)
 	slog.Debug("Elicitation request meta", "meta", req.Meta)
 
 	// Send elicitation request event to the runtime's client
-	eventsChannel <- ElicitationRequest(req.Message, req.RequestedSchema, req.Meta, r.currentAgent)
+	eventsChannel <- ElicitationRequest(req.Message, req.Mode, req.RequestedSchema, req.URL, req.ElicitationID, req.Meta, r.currentAgent)
 
 	// Wait for response from the client
 	select {

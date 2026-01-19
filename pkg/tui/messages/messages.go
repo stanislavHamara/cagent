@@ -1,5 +1,7 @@
 package messages
 
+import "github.com/docker/cagent/pkg/tools"
+
 // Session command messages
 type (
 	NewSessionMsg                  struct{}
@@ -11,6 +13,7 @@ type (
 	ExportSessionMsg               struct{ Filename string }
 	ShowCostDialogMsg              struct{}
 	ToggleYoloMsg                  struct{}
+	ToggleThinkingMsg              struct{}
 	ToggleHideToolResultsMsg       struct{}
 	StartShellMsg                  struct{}
 	SwitchAgentMsg                 struct{ AgentName string }
@@ -24,6 +27,7 @@ type (
 	StartSpeakMsg                  struct{}                   // Start speech-to-text transcription
 	StopSpeakMsg                   struct{}                   // Stop speech-to-text transcription
 	SpeakTranscriptMsg             struct{ Delta string }     // Transcription delta from speech-to-text
+	ClearQueueMsg                  struct{}                   // Clear all queued messages
 )
 
 // AgentCommandMsg command message
@@ -45,4 +49,10 @@ type OpenURLMsg struct {
 type ShowMCPPromptInputMsg struct {
 	PromptName string
 	PromptInfo any // mcptools.PromptInfo but avoiding import cycles
+}
+
+// ElicitationResponseMsg is sent when the user responds to an elicitation dialog
+type ElicitationResponseMsg struct {
+	Action  tools.ElicitationAction
+	Content map[string]any
 }

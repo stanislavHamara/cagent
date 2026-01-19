@@ -176,8 +176,10 @@ func (c *Client) CreateChatCompletionStream(
 	case "openai_chatcompletions":
 		slog.Debug("Using Chat Completions API", "api_type", apiType, "model", c.ModelConfig.Model)
 	default:
-		// Preserve existing behavior: auto-detect based on model name
-		if c.ModelConfig.Provider == "openai" && (strings.Contains(c.ModelConfig.Model, "-codex") || strings.Contains(c.ModelConfig.Model, "-pro")) {
+		// Auto-detect based on model name for OpenAI provider
+		// Use Responses API for newer models that support it (gpt-4.1+, o-series, gpt-5)
+		if c.ModelConfig.Provider == "openai" && isResponsesModel(c.ModelConfig.Model) {
+			slog.Debug("Auto-selecting Responses API", "model", c.ModelConfig.Model)
 			return c.CreateResponseStream(ctx, messages, requestTools)
 		}
 	}
@@ -211,7 +213,7 @@ func (c *Client) CreateChatCompletionStream(
 	}
 
 	if maxToken := c.ModelConfig.MaxTokens; maxToken != nil && *maxToken > 0 {
-		if !isResponsesOnlyModel(c.ModelConfig.Model) {
+		if !isResponsesModel(c.ModelConfig.Model) {
 			params.MaxTokens = openai.Int(*maxToken)
 			slog.Debug("OpenAI request configured with max tokens", "max_tokens", *maxToken, "model", c.ModelConfig.Model)
 		} else {
@@ -229,9 +231,6 @@ func (c *Client) CreateChatCompletionStream(
 				slog.Debug("Failed to convert tool parameters to OpenAI schema", "tool_name", tool.Name, "error", err)
 				return nil, err
 			}
-
-			// Fix missing item types in arrays
-			parameters = fixSchemaArrayItems(parameters)
 
 			toolsParam[i] = openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
 				Name:        tool.Name,
@@ -339,12 +338,6 @@ func (c *Client) CreateResponseStream(
 				return nil, err
 			}
 
-			// The Response API requires every parameter to be required
-			parameters = makeAllRequired(parameters)
-
-			// Fix missing item types in arrays
-			parameters = fixSchemaArrayItems(parameters)
-
 			toolsParam[i] = responses.ToolUnionParam{
 				OfFunction: &responses.FunctionToolParam{
 					Name:        tool.Name,
@@ -361,6 +354,27 @@ func (c *Client) CreateResponseStream(
 		if c.ModelConfig.ParallelToolCalls != nil {
 			params.ParallelToolCalls = param.NewOpt(*c.ModelConfig.ParallelToolCalls)
 		}
+	}
+
+	// Configure reasoning for models that support it (o-series, gpt-5)
+	// Request detailed reasoning summary to get thinking traces for reasoning models
+	// Skip reasoning configuration entirely if thinking is explicitly disabled (via /think command)
+	thinkingEnabled := c.ModelOptions.Thinking() == nil || *c.ModelOptions.Thinking()
+	if isOpenAIReasoningModel(c.ModelConfig.Model) && thinkingEnabled {
+		params.Reasoning = shared.ReasoningParam{
+			Summary: shared.ReasoningSummaryDetailed,
+		}
+		// Apply thinking budget as reasoning effort if configured
+		if c.ModelConfig.ThinkingBudget != nil {
+			effort, err := getOpenAIReasoningEffort(&c.ModelConfig)
+			if err != nil {
+				slog.Error("OpenAI responses request using thinking_budget failed", "error", err)
+				return nil, err
+			}
+			params.Reasoning.Effort = shared.ReasoningEffort(effort)
+			slog.Debug("OpenAI responses request using thinking_budget", "reasoning_effort", effort)
+		}
+		slog.Debug("OpenAI responses request configured with reasoning summary", "model", c.ModelConfig.Model, "summary", "detailed")
 	}
 
 	// Apply structured output configuration
@@ -822,15 +836,17 @@ func isCustomProvider(cfg *latest.ModelConfig) bool {
 	return getAPIType(cfg) != ""
 }
 
-// isResponsesOnlyModel returns true for newer OpenAI models that use the Responses API
-// and expect max_completion_tokens/max_output_tokens instead of max_tokens
-func isResponsesOnlyModel(model string) bool {
+// isResponsesModel returns true for OpenAI models that should use the Responses API.
+// This includes newer models (gpt-4.1+, o-series, gpt-5) and special variants (-codex).
+func isResponsesModel(model string) bool {
 	m := strings.ToLower(model)
 	return strings.HasPrefix(m, "gpt-4.1") ||
 		strings.HasPrefix(m, "o1") ||
 		strings.HasPrefix(m, "o3") ||
 		strings.HasPrefix(m, "o4") ||
-		strings.HasPrefix(m, "gpt-5")
+		strings.HasPrefix(m, "gpt-5") ||
+		strings.HasPrefix(m, "codex") ||
+		strings.Contains(m, "-codex")
 }
 
 func isOpenAIReasoningModel(model string) bool {

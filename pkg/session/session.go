@@ -62,6 +62,12 @@ type Session struct {
 	// ToolsApproved is a flag to indicate if the tools have been approved
 	ToolsApproved bool `json:"tools_approved"`
 
+	// Thinking is a session-level flag to enable thinking/interleaved thinking
+	// defaults for all providers. When false, providers will not apply auto-thinking budgets
+	// or interleaved thinking, regardless of model config. This is controlled by the /think
+	// command in the TUI. Defaults to true (thinking enabled).
+	Thinking bool `json:"thinking"`
+
 	// HideToolResults is a flag to indicate if tool results should be hidden
 	HideToolResults bool `json:"hide_tool_results"`
 
@@ -99,6 +105,20 @@ type Session struct {
 	// Sub-sessions are not persisted as standalone entries; they are embedded
 	// within the parent session's Messages array.
 	ParentID string `json:"-"`
+
+	// MessageUsageHistory stores per-message usage data for remote mode.
+	// In remote mode, messages are managed server-side, so we track usage separately.
+	// This is not persisted (json:"-") as it's only needed for the current session display.
+	MessageUsageHistory []MessageUsageRecord `json:"-"`
+}
+
+// MessageUsageRecord stores usage data for a single assistant message.
+// Used in remote mode where messages aren't stored in the client-side session.
+type MessageUsageRecord struct {
+	AgentName string     `json:"agent_name"`
+	Model     string     `json:"model"`
+	Cost      float64    `json:"cost"`
+	Usage     chat.Usage `json:"usage"`
 }
 
 // Permission mode constants
@@ -300,6 +320,35 @@ func (s *Session) getLastMessageContentByRole(role chat.MessageRole) string {
 	return ""
 }
 
+// UpdateLastAssistantMessageUsage updates the usage and cost fields of the last assistant message.
+// This is used in remote mode to populate per-message cost data from TokenUsageEvent.
+func (s *Session) UpdateLastAssistantMessageUsage(usage *chat.Usage, cost float64, model string) {
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].IsMessage() && s.Messages[i].Message.Message.Role == chat.MessageRoleAssistant {
+			s.Messages[i].Message.Message.Usage = usage
+			s.Messages[i].Message.Message.Cost = cost
+			if model != "" {
+				s.Messages[i].Message.Message.Model = model
+			}
+			return
+		}
+	}
+}
+
+// AddMessageUsageRecord appends a usage record for remote mode where messages aren't stored locally.
+// This enables the /cost dialog to show per-message breakdown even when using a remote runtime.
+func (s *Session) AddMessageUsageRecord(agentName, model string, cost float64, usage *chat.Usage) {
+	if usage == nil {
+		return
+	}
+	s.MessageUsageHistory = append(s.MessageUsageHistory, MessageUsageRecord{
+		AgentName: agentName,
+		Model:     model,
+		Cost:      cost,
+		Usage:     *usage,
+	})
+}
+
 type Opt func(s *Session)
 
 func WithUserMessage(content string) Opt {
@@ -344,6 +393,12 @@ func WithToolsApproved(toolsApproved bool) Opt {
 	}
 }
 
+func WithThinking(thinking bool) Opt {
+	return func(s *Session) {
+		s.Thinking = thinking
+	}
+}
+
 func WithHideToolResults(hideToolResults bool) Opt {
 	return func(s *Session) {
 		s.HideToolResults = hideToolResults
@@ -384,6 +439,7 @@ func New(opts ...Opt) *Session {
 		ID:              sessionID,
 		CreatedAt:       time.Now(),
 		SendUserMessage: true,
+		Thinking:        true, // Default to thinking enabled
 	}
 
 	for _, opt := range opts {
@@ -393,9 +449,19 @@ func New(opts ...Opt) *Session {
 	return s
 }
 
-func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
-	slog.Debug("Getting messages for agent", "agent", a.Name(), "session_id", s.ID)
+func markLastMessageAsCacheControl(messages []chat.Message) {
+	if len(messages) > 0 {
+		messages[len(messages)-1].CacheControl = true
+	}
+}
 
+// buildInvariantSystemMessages builds system messages that are identical
+// for all users of a given agent configuration. These messages can be
+// cached efficiently as they don't change between sessions, users, or projects.
+//
+// These messages are determined solely by the agent configuration and
+// remain constant across different sessions, users, and working directories.
+func buildInvariantSystemMessages(a *agent.Agent) []chat.Message {
 	var messages []chat.Message
 
 	if a.HasSubAgents() {
@@ -465,11 +531,20 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		}
 	}
 
-	// Cache control checkpoint #1 out of 4
-	// At the end of the system messages that are most likely to be invariant.
-	if len(messages) > 0 {
-		messages[len(messages)-1].CacheControl = true
-	}
+	markLastMessageAsCacheControl(messages)
+
+	return messages
+}
+
+// buildContextSpecificSystemMessages builds system messages that vary
+// per user, project, or time. These messages should come after
+// the invariant checkpoint to maintain optimal caching behavior.
+//
+// These messages depend on runtime context (working directory, current date,
+// user-specific skills) and cannot be cached across sessions or users.
+// Note: Session summary is handled separately in buildSessionSummaryMessages.
+func buildContextSpecificSystemMessages(a *agent.Agent, s *Session) []chat.Message {
+	var messages []chat.Message
 
 	if a.AddDate() {
 		messages = append(messages, chat.Message{
@@ -495,13 +570,13 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		}
 
 		for _, prompt := range a.AddPromptFiles() {
-			additionalPrompt, err := readPromptFile(wd, prompt)
+			additionalPrompts, err := readPromptFiles(wd, prompt)
 			if err != nil {
 				slog.Error("reading prompt file", "file", prompt, "error", err)
 				continue
 			}
 
-			if additionalPrompt != "" {
+			for _, additionalPrompt := range additionalPrompts {
 				messages = append(messages, chat.Message{
 					Role:    chat.MessageRoleSystem,
 					Content: additionalPrompt,
@@ -520,6 +595,20 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		}
 	}
 
+	// this is still useful to mark those messages as cachecontrol, so that if a user starts a second prompt for the same project, the first prompt cacheincluding the user specifics can be leveraged
+	markLastMessageAsCacheControl(messages)
+
+	return messages
+}
+
+// buildSessionSummaryMessages builds system messages containing the session summary
+// if one exists. Session summaries are context-specific per session and thus should not have a checkpoint (they will be cached alongside the first user message anyway)
+//
+// lastSummaryIndex is the index of the last summary item in s.Messages, or -1 if none exists.
+func buildSessionSummaryMessages(s *Session) ([]chat.Message, int) {
+	var messages []chat.Message
+	// Find the last summary index to determine where conversation messages start
+	// and to include the summary in session summary messages
 	lastSummaryIndex := -1
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Summary != "" {
@@ -528,7 +617,7 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		}
 	}
 
-	if lastSummaryIndex != -1 {
+	if lastSummaryIndex >= 0 && lastSummaryIndex < len(s.Messages) {
 		messages = append(messages, chat.Message{
 			Role:      chat.MessageRoleSystem,
 			Content:   "Session Summary: " + s.Messages[lastSummaryIndex].Summary,
@@ -536,16 +625,27 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		})
 	}
 
-	startIndex := lastSummaryIndex + 1
-	if lastSummaryIndex == -1 {
-		startIndex = 0
-	}
+	return messages, lastSummaryIndex
+}
 
-	// Cache control checkpoint #2 out of 4
-	// At the end of all the system messages.
-	if len(messages) > 0 {
-		messages[len(messages)-1].CacheControl = true
-	}
+func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
+	slog.Debug("Getting messages for agent", "agent", a.Name(), "session_id", s.ID)
+
+	var messages []chat.Message
+
+	// Build invariant system messages (cacheable across sessions/users/projects)
+	invariantMessages := buildInvariantSystemMessages(a)
+	messages = append(messages, invariantMessages...)
+
+	// Build context-specific system messages (vary per user/project/time)
+	contextMessages := buildContextSpecificSystemMessages(a, s)
+	messages = append(messages, contextMessages...)
+
+	// Build session summary messages (vary per session)
+	summaryMessages, lastSummaryIndex := buildSessionSummaryMessages(s)
+	messages = append(messages, summaryMessages...)
+
+	startIndex := lastSummaryIndex + 1
 
 	// Begin adding conversation messages
 	for i := startIndex; i < len(s.Messages); i++ {

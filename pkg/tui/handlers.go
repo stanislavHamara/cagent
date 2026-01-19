@@ -11,6 +11,7 @@ import (
 
 	"github.com/docker/cagent/pkg/browser"
 	"github.com/docker/cagent/pkg/evaluation"
+	"github.com/docker/cagent/pkg/modelsdev"
 	mcptools "github.com/docker/cagent/pkg/tools/mcp"
 	"github.com/docker/cagent/pkg/tui/components/editor"
 	"github.com/docker/cagent/pkg/tui/components/notification"
@@ -27,7 +28,6 @@ func (a *appModel) handleNewSession() (tea.Model, tea.Cmd) {
 	a.application.NewSession()
 	sess := a.application.Session()
 	a.sessionState = service.NewSessionState(sess)
-	a.sessionTitle = ""
 	a.chatPage = chat.New(a.application, a.sessionState)
 	a.dialog = dialog.New()
 	a.statusBar.SetHelp(a.chatPage)
@@ -70,7 +70,6 @@ func (a *appModel) handleLoadSession(sessionID string) (tea.Model, tea.Cmd) {
 	// Cancel current session and replace with loaded one
 	a.application.ReplaceSession(context.Background(), sess)
 	a.sessionState = service.NewSessionState(sess)
-	a.sessionTitle = sess.Title
 	a.chatPage = chat.New(a.application, a.sessionState)
 	a.dialog = dialog.New()
 	a.statusBar.SetHelp(a.chatPage)
@@ -123,7 +122,7 @@ func (a *appModel) handleEvalSession(filename string) (tea.Model, tea.Cmd) {
 }
 
 func (a *appModel) handleExportSession(filename string) (tea.Model, tea.Cmd) {
-	exportFile, err := a.application.ExportHTML(filename)
+	exportFile, err := a.application.ExportHTML(context.Background(), filename)
 	if err != nil {
 		return a, notification.ErrorCmd(fmt.Sprintf("Failed to export session: %v", err))
 	}
@@ -178,8 +177,7 @@ func (a *appModel) handleSwitchAgent(agentName string) (tea.Model, tea.Cmd) {
 		return a, notification.ErrorCmd(fmt.Sprintf("Failed to switch to agent '%s': %v", agentName, err))
 	}
 
-	a.currentAgent = agentName
-	a.sessionState.SetCurrentAgent(agentName)
+	a.sessionState.SetCurrentAgentName(agentName)
 	return a, notification.SuccessCmd(fmt.Sprintf("Switched to agent '%s'", agentName))
 }
 
@@ -188,6 +186,33 @@ func (a *appModel) handleToggleYolo() (tea.Model, tea.Cmd) {
 	sess.ToolsApproved = !sess.ToolsApproved
 	a.sessionState.SetYoloMode(sess.ToolsApproved)
 	return a, nil
+}
+
+func (a *appModel) handleToggleThinking() (tea.Model, tea.Cmd) {
+	// Check if the current model supports reasoning
+	currentModel := a.application.CurrentAgentModel()
+	if !modelsdev.ModelSupportsReasoning(context.Background(), currentModel) {
+		return a, notification.InfoCmd("Thinking/reasoning is not supported for the current model")
+	}
+
+	sess := a.application.Session()
+	sess.Thinking = !sess.Thinking
+	a.sessionState.SetThinking(sess.Thinking)
+
+	// Persist the change to the database immediately
+	if store := a.application.SessionStore(); store != nil {
+		if err := store.UpdateSession(context.Background(), sess); err != nil {
+			return a, notification.ErrorCmd(fmt.Sprintf("Failed to save session: %v", err))
+		}
+	}
+
+	var msg string
+	if sess.Thinking {
+		msg = "Thinking/reasoning enabled for this session"
+	} else {
+		msg = "Thinking/reasoning disabled for this session"
+	}
+	return a, notification.InfoCmd(msg)
 }
 
 func (a *appModel) handleToggleHideToolResults() (tea.Model, tea.Cmd) {

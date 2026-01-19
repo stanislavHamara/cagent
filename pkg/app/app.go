@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ type App struct {
 	events             chan tea.Msg
 	throttleDuration   time.Duration
 	cancel             context.CancelFunc
+	currentAgentModel  string // Tracks the current agent's model ID from AgentInfoEvent
 }
 
 // Opt is an option for creating a new App.
@@ -101,7 +103,30 @@ func (a *App) Runtime() runtime.Runtime {
 
 // CurrentAgentCommands returns the commands for the active agent
 func (a *App) CurrentAgentCommands(ctx context.Context) types.Commands {
-	return a.runtime.CurrentAgentCommands(ctx)
+	return a.runtime.CurrentAgentInfo(ctx).Commands
+}
+
+// CurrentAgentModel returns the model ID for the current agent.
+// Returns the tracked model from AgentInfoEvent, or falls back to session overrides.
+// Returns empty string if no model information is available (fail-open scenario).
+func (a *App) CurrentAgentModel() string {
+	if a.currentAgentModel != "" {
+		return a.currentAgentModel
+	}
+	// Fallback to session overrides
+	if a.session != nil && a.session.AgentModelOverrides != nil {
+		agentName := a.runtime.CurrentAgentName()
+		if modelRef, ok := a.session.AgentModelOverrides[agentName]; ok {
+			return modelRef
+		}
+	}
+	return ""
+}
+
+// TrackCurrentAgentModel updates the tracked model ID for the current agent.
+// This is called when AgentInfoEvent is received from the runtime.
+func (a *App) TrackCurrentAgentModel(model string) {
+	a.currentAgentModel = model
 }
 
 // CurrentMCPPrompts returns the available MCP prompts for the active agent
@@ -191,8 +216,10 @@ func (a *App) Run(ctx context.Context, cancel context.CancelFunc, message string
 			a.session.AddMessage(session.UserMessage(message))
 		}
 		for event := range a.runtime.RunStream(ctx, a.session) {
+			// If context is cancelled, continue draining but don't forward events.
+			// This prevents the runtime from blocking on event sends.
 			if ctx.Err() != nil {
-				return
+				continue
 			}
 			a.events <- event
 		}
@@ -206,8 +233,10 @@ func (a *App) RunWithMessage(ctx context.Context, cancel context.CancelFunc, msg
 	go func() {
 		a.session.AddMessage(msg)
 		for event := range a.runtime.RunStream(ctx, a.session) {
+			// If context is cancelled, continue draining but don't forward events.
+			// This prevents the runtime from blocking on event sends.
 			if ctx.Err() != nil {
-				return
+				continue
 			}
 			a.events <- event
 		}
@@ -410,10 +439,8 @@ func (a *App) trackCustomModel(modelRef string) {
 	}
 
 	// Check if already tracked
-	for _, existing := range a.session.CustomModelsUsed {
-		if existing == modelRef {
-			return
-		}
+	if slices.Contains(a.session.CustomModelsUsed, modelRef) {
+		return
 	}
 
 	a.session.CustomModelsUsed = append(a.session.CustomModelsUsed, modelRef)
@@ -508,56 +535,46 @@ func (a *App) applySessionModelOverrides(ctx context.Context, sess *session.Sess
 func (a *App) throttleEvents(ctx context.Context, in <-chan tea.Msg) <-chan tea.Msg {
 	out := make(chan tea.Msg, 128)
 
-	go func() {
-		defer close(out)
+	var buffer []tea.Msg
+	var timerCh <-chan time.Time
 
-		var buffer []tea.Msg
-		ticker := time.NewTicker(a.throttleDuration)
-		defer ticker.Stop()
-
-		flush := func() {
-			if len(buffer) == 0 {
+	flush := func() {
+		for _, msg := range a.mergeEvents(buffer) {
+			select {
+			case out <- msg:
+			case <-ctx.Done():
 				return
 			}
-
-			// Merge events if possible
-			merged := a.mergeEvents(buffer)
-			for _, msg := range merged {
-				select {
-				case out <- msg:
-				case <-ctx.Done():
-					return
-				}
-			}
-			buffer = buffer[:0]
 		}
+
+		buffer = buffer[:0]
+		timerCh = nil
+	}
+	defer flush()
+
+	go func() {
+		defer close(out)
 
 		for {
 			select {
 			case <-ctx.Done():
-				flush()
 				return
 
 			case msg, ok := <-in:
 				if !ok {
-					flush()
 					return
 				}
 
-				// Check if this event type should be throttled
+				buffer = append(buffer, msg)
 				if a.shouldThrottle(msg) {
-					buffer = append(buffer, msg)
-				} else {
-					// Pass through immediately for important events
-					flush() // Flush any buffered events first
-					select {
-					case out <- msg:
-					case <-ctx.Done():
-						return
+					if timerCh == nil {
+						timerCh = time.After(a.throttleDuration)
 					}
+				} else {
+					flush()
 				}
 
-			case <-ticker.C:
+			case <-timerCh:
 				flush()
 			}
 		}
@@ -631,14 +648,14 @@ func (a *App) mergeEvents(events []tea.Msg) []tea.Msg {
 
 		case *runtime.PartialToolCallEvent:
 			// For PartialToolCallEvent, keep only the latest one per tool call ID
-			// Check if there's a newer one in the buffer
+			// Only merge consecutive events with the same ID
 			latest := ev
-			for j := i + 1; j < len(events); j++ {
-				if next, ok := events[j].(*runtime.PartialToolCallEvent); ok {
-					if next.ToolCall.ID == ev.ToolCall.ID {
-						latest = next
-						i = j // Skip to this position
-					}
+			for i+1 < len(events) {
+				if next, ok := events[i+1].(*runtime.PartialToolCallEvent); ok && next.ToolCall.ID == ev.ToolCall.ID {
+					latest = next
+					i++
+				} else {
+					break
 				}
 			}
 			result = append(result, latest)
@@ -654,13 +671,7 @@ func (a *App) mergeEvents(events []tea.Msg) []tea.Msg {
 
 // ExportHTML exports the current session as a standalone HTML file.
 // If filename is empty, a default name based on the session title and timestamp is used.
-func (a *App) ExportHTML(filename string) (string, error) {
-	// Get agent description from the runtime if available
-	var agentDescription string
-	if localRuntime, ok := a.runtime.(*runtime.LocalRuntime); ok {
-		if agent := localRuntime.CurrentAgent(); agent != nil {
-			agentDescription = agent.Description()
-		}
-	}
-	return export.SessionToFile(a.session, agentDescription, filename)
+func (a *App) ExportHTML(ctx context.Context, filename string) (string, error) {
+	agentInfo := a.runtime.CurrentAgentInfo(ctx)
+	return export.SessionToFile(a.session, agentInfo.Description, filename)
 }

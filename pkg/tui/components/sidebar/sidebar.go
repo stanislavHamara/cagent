@@ -1,6 +1,7 @@
 package sidebar
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -11,10 +12,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/docker/cagent/pkg/modelsdev"
 	"github.com/docker/cagent/pkg/paths"
 	"github.com/docker/cagent/pkg/runtime"
 	"github.com/docker/cagent/pkg/session"
 	"github.com/docker/cagent/pkg/tools"
+	chatmsgs "github.com/docker/cagent/pkg/tui/components/messages"
 	"github.com/docker/cagent/pkg/tui/components/scrollbar"
 	"github.com/docker/cagent/pkg/tui/components/spinner"
 	"github.com/docker/cagent/pkg/tui/components/tab"
@@ -46,6 +49,7 @@ type Model interface {
 	SetAgentSwitching(switching bool)
 	SetToolsetInfo(availableTools int, loading bool)
 	SetSessionStarred(starred bool)
+	SetQueuedMessages(messages []string)
 	GetSize() (width, height int)
 	LoadFromSession(sess *session.Session)
 	// HandleClick checks if click is on the star and returns true if handled
@@ -61,32 +65,35 @@ type ragIndexingState struct {
 
 // model implements Model
 type model struct {
-	width             int
-	height            int
-	xPos              int                       // absolute x position on screen
-	yPos              int                       // absolute y position on screen
-	layoutCfg         LayoutConfig              // layout configuration for spacing
-	sessionUsage      map[string]*runtime.Usage // sessionID -> latest usage snapshot
-	sessionAgent      map[string]string         // sessionID -> agent name
-	todoComp          *todotool.SidebarComponent
-	mcpInit           bool
-	ragIndexing       map[string]*ragIndexingState // strategy name -> indexing state
-	spinner           spinner.Spinner
-	mode              Mode
-	sessionTitle      string
-	sessionStarred    bool
-	sessionHasContent bool // true when session has been used (has messages)
-	currentAgent      string
-	agentModel        string
-	agentDescription  string
-	availableAgents   []runtime.AgentDetails
-	agentSwitching    bool
-	availableTools    int
-	toolsLoading      bool // true when more tools may still be loading
-	sessionState      *service.SessionState
-	workingAgent      string // Name of the agent currently working (empty if none)
-	scrollbar         *scrollbar.Model
-	workingDirectory  string
+	width              int
+	height             int
+	xPos               int                       // absolute x position on screen
+	yPos               int                       // absolute y position on screen
+	layoutCfg          LayoutConfig              // layout configuration for spacing
+	sessionUsage       map[string]*runtime.Usage // sessionID -> latest usage snapshot
+	sessionAgent       map[string]string         // sessionID -> agent name
+	todoComp           *todotool.SidebarComponent
+	mcpInit            bool
+	ragIndexing        map[string]*ragIndexingState // strategy name -> indexing state
+	spinner            spinner.Spinner
+	mode               Mode
+	sessionTitle       string
+	sessionStarred     bool
+	sessionHasContent  bool // true when session has been used (has messages)
+	currentAgent       string
+	agentModel         string
+	agentDescription   string
+	availableAgents    []runtime.AgentDetails
+	agentSwitching     bool
+	availableTools     int
+	toolsLoading       bool // true when more tools may still be loading
+	sessionState       *service.SessionState
+	workingAgent       string // Name of the agent currently working (empty if none)
+	scrollbar          *scrollbar.Model
+	workingDirectory   string
+	queuedMessages     []string // Truncated preview of queued messages
+	streamCancelled    bool     // true after ESC cancel until next StreamStartedEvent
+	reasoningSupported bool     // true if current model supports reasoning (default: true / fail-open)
 }
 
 // Option is a functional option for configuring the sidebar.
@@ -99,18 +106,19 @@ func WithLayoutConfig(cfg LayoutConfig) Option {
 
 func New(sessionState *service.SessionState, opts ...Option) Model {
 	m := &model{
-		width:            20,
-		layoutCfg:        DefaultLayoutConfig(),
-		height:           24,
-		sessionUsage:     make(map[string]*runtime.Usage),
-		sessionAgent:     make(map[string]string),
-		todoComp:         todotool.NewSidebarComponent(),
-		spinner:          spinner.New(spinner.ModeSpinnerOnly, styles.SpinnerDotsHighlightStyle),
-		sessionTitle:     "New session",
-		ragIndexing:      make(map[string]*ragIndexingState),
-		sessionState:     sessionState,
-		scrollbar:        scrollbar.New(),
-		workingDirectory: getCurrentWorkingDirectory(),
+		width:              20,
+		layoutCfg:          DefaultLayoutConfig(),
+		height:             24,
+		sessionUsage:       make(map[string]*runtime.Usage),
+		sessionAgent:       make(map[string]string),
+		todoComp:           todotool.NewSidebarComponent(),
+		spinner:            spinner.New(spinner.ModeSpinnerOnly, styles.SpinnerDotsHighlightStyle),
+		sessionTitle:       "New session",
+		ragIndexing:        make(map[string]*ragIndexingState),
+		sessionState:       sessionState,
+		scrollbar:          scrollbar.New(),
+		workingDirectory:   getCurrentWorkingDirectory(),
+		reasoningSupported: true, // Default to true (fail-open)
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -141,16 +149,22 @@ func (m *model) SetTodos(result *tools.ToolCallResult) error {
 }
 
 // SetAgentInfo sets the current agent information and updates the model in availableAgents
-func (m *model) SetAgentInfo(agentName, model, description string) {
+func (m *model) SetAgentInfo(agentName, modelID, description string) {
 	m.currentAgent = agentName
-	m.agentModel = model
+	m.agentModel = modelID
 	m.agentDescription = description
+	m.reasoningSupported = modelsdev.ModelSupportsReasoning(context.Background(), modelID)
 
 	// Update the model in availableAgents for the current agent
 	// This is important when model routing selects a different model than configured
+	// Extract just the model name from "provider/model" format to match TeamInfoEvent format
 	for i := range m.availableAgents {
-		if m.availableAgents[i].Name == agentName && model != "" {
-			m.availableAgents[i].Model = model
+		if m.availableAgents[i].Name == agentName && modelID != "" {
+			modelName := modelID
+			if idx := strings.LastIndex(modelName, "/"); idx != -1 {
+				modelName = modelName[idx+1:]
+			}
+			m.availableAgents[i].Model = modelName
 			break
 		}
 	}
@@ -175,6 +189,11 @@ func (m *model) SetToolsetInfo(availableTools int, loading bool) {
 // SetSessionStarred sets the starred status of the current session
 func (m *model) SetSessionStarred(starred bool) {
 	m.sessionStarred = starred
+}
+
+// SetQueuedMessages sets the list of queued message previews to display
+func (m *model) SetQueuedMessages(messages []string) {
+	m.queuedMessages = messages
 }
 
 // HandleClick checks if click is on the star and returns true if it was
@@ -298,12 +317,20 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		m.SetTokenUsage(msg)
 		return m, nil
 	case *runtime.MCPInitStartedEvent:
+		// Ignore if stream was cancelled (stale event from before cancellation)
+		if m.streamCancelled {
+			return m, nil
+		}
 		m.mcpInit = true
 		return m, m.spinner.Init()
 	case *runtime.MCPInitFinishedEvent:
 		m.mcpInit = false
 		return m, nil
 	case *runtime.RAGIndexingStartedEvent:
+		// Ignore if stream was cancelled (stale event from before cancellation)
+		if m.streamCancelled {
+			return m, nil
+		}
 		// Use composite key: "ragName/strategyName" to differentiate strategies within same RAG manager
 		key := msg.RAGName + "/" + msg.StrategyName
 		slog.Debug("Sidebar received RAG indexing started event", "rag", msg.RAGName, "strategy", msg.StrategyName, "key", key)
@@ -329,6 +356,8 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		m.sessionTitle = msg.Title
 		return m, nil
 	case *runtime.StreamStartedEvent:
+		// New stream starting - reset cancelled flag and enable spinner
+		m.streamCancelled = false
 		m.workingAgent = msg.AgentName
 		return m, m.spinner.Init()
 	case *runtime.StreamStoppedEvent:
@@ -344,9 +373,24 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		m.SetAgentSwitching(msg.Switching)
 		return m, nil
 	case *runtime.ToolsetInfoEvent:
+		// Ignore loading state if stream was cancelled (stale event from before cancellation)
+		if m.streamCancelled && msg.Loading {
+			return m, nil
+		}
 		m.SetToolsetInfo(msg.AvailableTools, msg.Loading)
 		if msg.Loading {
 			return m, m.spinner.Init()
+		}
+		return m, nil
+	case chatmsgs.StreamCancelledMsg:
+		// Clear all spinner-driving state when stream is cancelled via ESC
+		m.streamCancelled = true
+		m.workingAgent = ""
+		m.toolsLoading = false
+		m.mcpInit = false
+		// Clear any in-flight RAG indexing state
+		for k := range m.ragIndexing {
+			delete(m.ragIndexing, k)
 		}
 		return m, nil
 	default:
@@ -366,10 +410,7 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
-		if len(cmds) > 0 {
-			return m, tea.Batch(cmds...)
-		}
-		return m, nil
+		return m, tea.Batch(cmds...)
 	}
 }
 
@@ -478,6 +519,7 @@ func (m *model) renderSections(contentWidth int) []string {
 
 	appendSection(m.sessionInfo(contentWidth))
 	appendSection(m.tokenUsage(contentWidth))
+	appendSection(m.queueSection(contentWidth))
 	appendSection(m.agentInfo(contentWidth))
 	appendSection(m.toolsetInfo(contentWidth))
 
@@ -635,10 +677,40 @@ func (m *model) sessionInfo(contentWidth int) string {
 	return m.renderTab("Session", strings.Join(lines, "\n"), contentWidth)
 }
 
+// queueSection renders the queued messages section
+func (m *model) queueSection(contentWidth int) string {
+	if len(m.queuedMessages) == 0 {
+		return ""
+	}
+
+	maxMsgWidth := contentWidth - treePrefixWidth
+	var lines []string
+
+	for i, msg := range m.queuedMessages {
+		// Determine prefix based on position
+		var prefix string
+		if i == len(m.queuedMessages)-1 {
+			prefix = styles.MutedStyle.Render("└ ")
+		} else {
+			prefix = styles.MutedStyle.Render("├ ")
+		}
+
+		// Truncate message and add prefix
+		truncated := toolcommon.TruncateText(msg, maxMsgWidth)
+		lines = append(lines, prefix+truncated)
+	}
+
+	// Add hint for clearing
+	lines = append(lines, styles.MutedStyle.Render("  Ctrl+X to clear"))
+
+	title := fmt.Sprintf("Queue (%d)", len(m.queuedMessages))
+	return m.renderTab(title, strings.Join(lines, "\n"), contentWidth)
+}
+
 // agentInfo renders the current agent information
 func (m *model) agentInfo(contentWidth int) string {
 	// Read current agent from session state so sidebar updates when agent is switched
-	currentAgent := m.sessionState.CurrentAgent
+	currentAgent := m.sessionState.CurrentAgentName()
 	if currentAgent == "" {
 		return ""
 	}
@@ -714,14 +786,16 @@ func (m *model) toolsetInfo(contentWidth int) string {
 	lines = append(lines, m.renderToolsStatus())
 
 	// Toggle indicators with shortcuts
+	// Only show "Thinking enabled" if the model supports reasoning
 	toggles := []struct {
 		enabled  bool
 		label    string
 		shortcut string
 	}{
-		{m.sessionState.YoloMode, "YOLO mode enabled", "^y"},
-		{m.sessionState.HideToolResults, "Tool output hidden", "^o"},
-		{m.sessionState.SplitDiffView, "Split Diff View enabled", "^t"},
+		{m.sessionState.YoloMode(), "YOLO mode enabled", "^y"},
+		{m.sessionState.Thinking() && m.reasoningSupported, "Thinking enabled", "/think"},
+		{m.sessionState.HideToolResults(), "Tool output hidden", "^o"},
+		{m.sessionState.SplitDiffView(), "Split Diff View enabled", "^t"},
 	}
 
 	for _, toggle := range toggles {

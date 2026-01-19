@@ -3,6 +3,7 @@ package tui
 import (
 	"cmp"
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	goruntime "runtime"
@@ -33,7 +34,7 @@ import (
 // appModel represents the main application model
 type appModel struct {
 	application     *app.App
-	wWidth, wHeight int // Window dimensions
+	wWidth, wHeight int
 	width, height   int
 	keyMap          KeyMap
 
@@ -44,18 +45,10 @@ type appModel struct {
 	dialog       dialog.Manager
 	completions  completion.Manager
 
-	// Session state
 	sessionState *service.SessionState
-	sessionTitle string // Current session title for terminal window
 
-	// Agent state
-	availableAgents []runtime.AgentDetails
-	currentAgent    string
-
-	// Speech-to-text transcriber
 	transcriber *transcribe.Transcriber
 
-	// State
 	ready bool
 	err   error
 }
@@ -69,6 +62,7 @@ type KeyMap struct {
 	SwitchAgent           key.Binding
 	ModelPicker           key.Binding
 	Speak                 key.Binding
+	ClearQueue            key.Binding
 }
 
 // DefaultKeyMap returns the default global key bindings
@@ -101,6 +95,10 @@ func DefaultKeyMap() KeyMap {
 		Speak: key.NewBinding(
 			key.WithKeys("ctrl+k"),
 			key.WithHelp("Ctrl+k", "speak"),
+		),
+		ClearQueue: key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("Ctrl+x", "clear queue"),
 		),
 	}
 }
@@ -187,27 +185,23 @@ func (a *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, dialogCmd
 
 	case *runtime.TeamInfoEvent:
-		// Store team info for agent switching shortcuts
-		a.availableAgents = msg.AvailableAgents
-		a.currentAgent = msg.CurrentAgent
-		a.sessionState.SetCurrentAgent(msg.CurrentAgent)
+		a.sessionState.SetAvailableAgents(msg.AvailableAgents)
+		a.sessionState.SetCurrentAgentName(msg.CurrentAgent)
 		// Forward to chat page
 		updated, cmd := a.chatPage.Update(msg)
 		a.chatPage = updated.(chat.Page)
 		return a, cmd
 
 	case *runtime.AgentInfoEvent:
-		// Track current agent
-		a.currentAgent = msg.AgentName
-		a.sessionState.SetCurrentAgent(msg.AgentName)
+		a.sessionState.SetCurrentAgentName(msg.AgentName)
+		a.application.TrackCurrentAgentModel(msg.Model)
 		// Forward to chat page
 		updated, cmd := a.chatPage.Update(msg)
 		a.chatPage = updated.(chat.Page)
 		return a, cmd
 
 	case *runtime.SessionTitleEvent:
-		// Store session title for terminal window title
-		a.sessionTitle = msg.Title
+		a.sessionState.SetSessionTitle(msg.Title)
 		// Forward to chat page (which forwards to sidebar)
 		updated, cmd := a.chatPage.Update(msg)
 		a.chatPage = updated.(chat.Page)
@@ -294,8 +288,16 @@ func (a *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.ToggleYoloMsg:
 		return a.handleToggleYolo()
 
+	case messages.ToggleThinkingMsg:
+		return a.handleToggleThinking()
+
 	case messages.ToggleHideToolResultsMsg:
 		return a.handleToggleHideToolResults()
+
+	case messages.ClearQueueMsg:
+		updated, cmd := a.chatPage.Update(msg)
+		a.chatPage = updated.(chat.Page)
+		return a, cmd
 
 	case messages.ShowCostDialogMsg:
 		return a.handleShowCostDialog()
@@ -332,6 +334,14 @@ func (a *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case messages.ChangeModelMsg:
 		return a.handleChangeModel(msg.ModelRef)
+
+	case messages.ElicitationResponseMsg:
+		// Handle elicitation response from the dialog
+		if err := a.application.ResumeElicitation(context.Background(), msg.Action, msg.Content); err != nil {
+			slog.Error("Failed to resume elicitation", "action", msg.Action, "error", err)
+			return a, notification.ErrorCmd("Failed to complete server request: " + err.Error())
+		}
+		return a, nil
 
 	case speakTranscriptAndContinue:
 		// Insert the transcript delta into the editor
@@ -374,21 +384,20 @@ func (a *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.dialog.Open() {
 			u, dialogCmd := a.dialog.Update(msg)
 			a.dialog = u.(dialog.Manager)
-			return a, dialogCmd
+
+			updated, cmdChatPage := a.chatPage.Update(msg)
+			a.chatPage = updated.(chat.Page)
+
+			return a, tea.Batch(dialogCmd, cmdChatPage)
 		}
 
-		var cmds []tea.Cmd
-		var cmd tea.Cmd
-
-		updated, cmd := a.completions.Update(msg)
-		cmds = append(cmds, cmd)
+		updated, cmdCompletions := a.completions.Update(msg)
 		a.completions = updated.(completion.Manager)
 
-		updated, cmd = a.chatPage.Update(msg)
-		cmds = append(cmds, cmd)
+		updated, cmdChatPage := a.chatPage.Update(msg)
 		a.chatPage = updated.(chat.Page)
 
-		return a, tea.Batch(cmds...)
+		return a, tea.Batch(cmdCompletions, cmdChatPage)
 	}
 }
 
@@ -497,6 +506,9 @@ func (a *appModel) handleKeyPressMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return a, notification.InfoCmd("Speech-to-text is only supported on macOS")
 
+	case key.Matches(msg, a.keyMap.ClearQueue):
+		return a, core.CmdHandler(messages.ClearQueueMsg{})
+
 	default:
 		// Handle ctrl+1 through ctrl+9 for quick agent switching
 		if index := parseCtrlNumberKey(msg); index >= 0 {
@@ -519,9 +531,10 @@ func parseCtrlNumberKey(msg tea.KeyPressMsg) int {
 
 // switchToAgentByIndex switches to the agent at the given index
 func (a *appModel) switchToAgentByIndex(index int) (tea.Model, tea.Cmd) {
-	if index >= 0 && index < len(a.availableAgents) {
-		agentName := a.availableAgents[index].Name
-		if agentName != a.currentAgent {
+	availableAgents := a.sessionState.AvailableAgents()
+	if index >= 0 && index < len(availableAgents) {
+		agentName := availableAgents[index].Name
+		if agentName != a.sessionState.CurrentAgentName() {
 			return a, core.CmdHandler(messages.SwitchAgentMsg{AgentName: agentName})
 		}
 	}
@@ -530,21 +543,22 @@ func (a *appModel) switchToAgentByIndex(index int) (tea.Model, tea.Cmd) {
 
 // cycleToNextAgent cycles to the next agent in the available agents list
 func (a *appModel) cycleToNextAgent() (tea.Model, tea.Cmd) {
-	if len(a.availableAgents) <= 1 {
+	availableAgents := a.sessionState.AvailableAgents()
+	if len(availableAgents) <= 1 {
 		return a, notification.InfoCmd("No other agents available")
 	}
 
 	// Find the current agent index
 	currentIndex := -1
-	for i, agent := range a.availableAgents {
-		if agent.Name == a.currentAgent {
+	for i, agent := range availableAgents {
+		if agent.Name == a.sessionState.CurrentAgentName() {
 			currentIndex = i
 			break
 		}
 	}
 
 	// Cycle to the next agent (wrap around to 0 if at the end)
-	nextIndex := (currentIndex + 1) % len(a.availableAgents)
+	nextIndex := (currentIndex + 1) % len(availableAgents)
 	return a.switchToAgentByIndex(nextIndex)
 }
 
@@ -614,8 +628,8 @@ func (a *appModel) View() tea.View {
 
 // windowTitle returns the terminal window title
 func (a *appModel) windowTitle() string {
-	if a.sessionTitle != "" {
-		return a.sessionTitle + " - cagent"
+	if sessionTitle := a.sessionState.SessionTitle(); sessionTitle != "" {
+		return sessionTitle + " - cagent"
 	}
 	return "cagent"
 }

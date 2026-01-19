@@ -46,6 +46,24 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 
 	case *runtime.TokenUsageEvent:
 		p.sidebar.SetTokenUsage(msg)
+		if msg.Usage != nil {
+			if sess := p.app.Session(); sess != nil {
+				// Update session-level totals
+				sess.InputTokens = msg.Usage.InputTokens
+				sess.OutputTokens = msg.Usage.OutputTokens
+				sess.Cost = msg.Usage.Cost
+
+				// Track per-message usage for /cost dialog
+				if msg.Usage.LastMessage != nil {
+					sess.AddMessageUsageRecord(
+						msg.AgentName,
+						msg.Usage.LastMessage.Model,
+						msg.Usage.LastMessage.Cost,
+						&msg.Usage.LastMessage.Usage,
+					)
+				}
+			}
+		}
 		return true, nil
 
 	case *runtime.SessionCompactionEvent:
@@ -120,14 +138,14 @@ func (p *chatPage) handleAgentChoice(msg *runtime.AgentChoiceEvent) tea.Cmd {
 	if p.streamCancelled {
 		return nil
 	}
-	return p.messages.AppendToLastMessage(msg.AgentName, types.MessageTypeAssistant, msg.Content)
+	return p.messages.AppendToLastMessage(msg.AgentName, msg.Content)
 }
 
 func (p *chatPage) handleAgentChoiceReasoning(msg *runtime.AgentChoiceReasoningEvent) tea.Cmd {
 	if p.streamCancelled {
 		return nil
 	}
-	return p.messages.AppendToLastMessage(msg.AgentName, types.MessageTypeAssistantReasoning, msg.Content)
+	return p.messages.AppendReasoning(msg.AgentName, msg.Content)
 }
 
 func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd {
@@ -138,7 +156,11 @@ func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd 
 	p.streamCancelled = false
 	p.stopProgressBar()
 	sidebarCmd := p.forwardToSidebar(msg)
-	return tea.Batch(p.messages.ScrollToBottom(), spinnerCmd, sidebarCmd)
+
+	// Check if there are queued messages to process
+	queueCmd := p.processNextQueuedMessage()
+
+	return tea.Batch(p.messages.ScrollToBottom(), spinnerCmd, sidebarCmd, queueCmd)
 }
 
 func (p *chatPage) handlePartialToolCall(msg *runtime.PartialToolCallEvent) tea.Cmd {
@@ -188,13 +210,38 @@ func (p *chatPage) handleMaxIterationsReached(msg *runtime.MaxIterationsReachedE
 }
 
 func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent) tea.Cmd {
-	// TODO: handle normal elicitation requests
 	spinnerCmd := p.setWorking(false)
 
-	serverURL := msg.Meta["cagent/server_url"].(string)
-	dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-		Model: dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
-	})
+	// Check if this is an OAuth flow by looking at the meta type
+	// Guard against nil Meta map to prevent panic
+	if msg.Meta != nil {
+		if elicitationType, ok := msg.Meta["cagent/type"].(string); ok && elicitationType == "oauth_flow" {
+			// OAuth flow - show the OAuth authorization dialog
+			var serverURL string
+			if url, ok := msg.Meta["cagent/server_url"].(string); ok {
+				serverURL = url
+			}
+			dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
+				Model: dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
+			})
+			return tea.Batch(spinnerCmd, dialogCmd)
+		}
+	}
 
-	return tea.Batch(spinnerCmd, dialogCmd)
+	// Check elicitation mode
+	switch msg.Mode {
+	case "url":
+		// URL-based elicitation - show URL dialog
+		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
+			Model: dialog.NewURLElicitationDialog(msg.Message, msg.URL),
+		})
+		return tea.Batch(spinnerCmd, dialogCmd)
+
+	default:
+		// Form-based elicitation (default) - show form dialog
+		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
+			Model: dialog.NewElicitationDialog(msg.Message, msg.Schema, msg.Meta),
+		})
+		return tea.Batch(spinnerCmd, dialogCmd)
+	}
 }

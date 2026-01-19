@@ -3,6 +3,8 @@ package runtime
 import (
 	"cmp"
 
+	"github.com/docker/cagent/pkg/chat"
+	"github.com/docker/cagent/pkg/config/types"
 	"github.com/docker/cagent/pkg/tools"
 )
 
@@ -194,14 +196,27 @@ type TokenUsageEvent struct {
 }
 
 type Usage struct {
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	ContextLength int64   `json:"context_length"`
-	ContextLimit  int64   `json:"context_limit"`
-	Cost          float64 `json:"cost"`
+	InputTokens   int64         `json:"input_tokens"`
+	OutputTokens  int64         `json:"output_tokens"`
+	ContextLength int64         `json:"context_length"`
+	ContextLimit  int64         `json:"context_limit"`
+	Cost          float64       `json:"cost"`
+	LastMessage   *MessageUsage `json:"last_message,omitempty"`
+}
+
+// MessageUsage contains per-message usage data to include in TokenUsageEvent.
+// It embeds chat.Usage and adds Cost and Model fields.
+type MessageUsage struct {
+	chat.Usage
+	Cost  float64
+	Model string
 }
 
 func TokenUsage(sessionID, agentName string, inputTokens, outputTokens, contextLength, contextLimit int64, cost float64) Event {
+	return TokenUsageWithMessage(sessionID, agentName, inputTokens, outputTokens, contextLength, contextLimit, cost, nil)
+}
+
+func TokenUsageWithMessage(sessionID, agentName string, inputTokens, outputTokens, contextLength, contextLimit int64, cost float64, msgUsage *MessageUsage) Event {
 	return &TokenUsageEvent{
 		Type:      "token_usage",
 		SessionID: sessionID,
@@ -211,6 +226,7 @@ func TokenUsage(sessionID, agentName string, inputTokens, outputTokens, contextL
 			InputTokens:   inputTokens,
 			OutputTokens:  outputTokens,
 			Cost:          cost,
+			LastMessage:   msgUsage,
 		},
 		AgentContext: AgentContext{AgentName: agentName},
 	}
@@ -279,20 +295,26 @@ func StreamStopped(sessionID, agentName string) Event {
 
 // ElicitationRequestEvent is sent when an elicitation request is received from an MCP server
 type ElicitationRequestEvent struct {
-	Type    string         `json:"type"`
-	Message string         `json:"message"`
-	Schema  any            `json:"schema"`
-	Meta    map[string]any `json:"meta,omitempty"`
+	Type          string         `json:"type"`
+	Message       string         `json:"message"`
+	Mode          string         `json:"mode,omitempty"` // "form" or "url"
+	Schema        any            `json:"schema,omitempty"`
+	URL           string         `json:"url,omitempty"`
+	ElicitationID string         `json:"elicitation_id,omitempty"`
+	Meta          map[string]any `json:"meta,omitempty"`
 	AgentContext
 }
 
-func ElicitationRequest(message string, schema any, meta map[string]any, agentName string) Event {
+func ElicitationRequest(message, mode string, schema any, url, elicitationID string, meta map[string]any, agentName string) Event {
 	return &ElicitationRequestEvent{
-		Type:         "elicitation_request",
-		Message:      message,
-		Schema:       schema,
-		Meta:         meta,
-		AgentContext: AgentContext{AgentName: agentName},
+		Type:          "elicitation_request",
+		Message:       message,
+		Mode:          mode,
+		Schema:        schema,
+		URL:           url,
+		ElicitationID: elicitationID,
+		Meta:          meta,
+		AgentContext:  AgentContext{AgentName: agentName},
 	}
 }
 
@@ -352,7 +374,7 @@ func MCPInitFinished(agentName string) Event {
 type AgentInfoEvent struct {
 	Type           string `json:"type"`
 	AgentName      string `json:"agent_name"`
-	Model          string `json:"model"`
+	Model          string `json:"model"` // this is in provider/model format (e.g., "openai/gpt-4o")
 	Description    string `json:"description"`
 	WelcomeMessage string `json:"welcome_message,omitempty"`
 	AgentContext
@@ -371,10 +393,11 @@ func AgentInfo(agentName, model, description, welcomeMessage string) Event {
 
 // AgentDetails contains information about an agent for display in the sidebar
 type AgentDetails struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Provider    string `json:"provider"`
-	Model       string `json:"model"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Provider    string         `json:"provider"`
+	Model       string         `json:"model"`
+	Commands    types.Commands `json:"commands,omitempty"`
 }
 
 // TeamInfoEvent is sent when team information is available
