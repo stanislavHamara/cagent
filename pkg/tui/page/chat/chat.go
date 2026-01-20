@@ -205,10 +205,11 @@ func defaultKeyMap() KeyMap {
 	return KeyMap{
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),
-			key.WithHelp("TAB", "switch focus"),
+			key.WithHelp("Tab", "switch focus"),
 		),
 		Cancel: key.NewBinding(
 			key.WithKeys("esc"),
+			key.WithHelp("Esc", "interrupt"),
 		),
 		// Show newline help in footer. Terminals that support Shift+Enter will use it.
 		// Ctrl+J acts as a fallback on terminals that don't distinguish Shift+Enter.
@@ -320,11 +321,7 @@ func (p *chatPage) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		return p.handleMouseWheel(msg)
 
-	case editor.SendMsg:
-		slog.Debug(msg.Content)
-		return p.handleSendMsg(msg)
-
-	case messages.StreamCancelledMsg:
+	case msgtypes.StreamCancelledMsg:
 		model, cmd := p.messages.Update(msg)
 		p.messages = model.(messages.Model)
 
@@ -346,6 +343,10 @@ func (p *chatPage) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 
 		return p, tea.Batch(cmds...)
+
+	case msgtypes.SendMsg:
+		slog.Debug(msg.Content)
+		return p.handleSendMsg(msg)
 
 	case msgtypes.InsertFileRefMsg:
 		// Attach file using editor's AttachFile method which registers the attachment
@@ -584,7 +585,7 @@ func (p *chatPage) updateNewlineHelp() {
 	} else {
 		p.keyMap.ShiftNewline = key.NewBinding(
 			key.WithKeys("ctrl+j"),
-			key.WithHelp("ctrl+j", "newline"),
+			key.WithHelp("Ctrl+j", "newline"),
 		)
 	}
 }
@@ -602,14 +603,14 @@ func (p *chatPage) cancelStream(showCancelMessage bool) tea.Cmd {
 
 	// Send StreamCancelledMsg to all components to handle cleanup
 	return tea.Batch(
-		core.CmdHandler(messages.StreamCancelledMsg{ShowMessage: showCancelMessage}),
+		core.CmdHandler(msgtypes.StreamCancelledMsg{ShowMessage: showCancelMessage}),
 		p.setWorking(false),
 	)
 }
 
 // handleSendMsg handles incoming messages from the editor, either processing
 // them immediately or queuing them if the agent is busy.
-func (p *chatPage) handleSendMsg(msg editor.SendMsg) (layout.Model, tea.Cmd) {
+func (p *chatPage) handleSendMsg(msg msgtypes.SendMsg) (layout.Model, tea.Cmd) {
 	// If not working, process immediately
 	if !p.working {
 		cmd := p.processMessage(msg)
@@ -647,7 +648,7 @@ func (p *chatPage) processNextQueuedMessage() tea.Cmd {
 	p.messageQueue = p.messageQueue[1:]
 	p.syncQueueToSidebar()
 
-	msg := editor.SendMsg{
+	msg := msgtypes.SendMsg{
 		Content:     queued.content,
 		Attachments: queued.attachments,
 	}
@@ -685,11 +686,11 @@ func (p *chatPage) syncQueueToSidebar() {
 		}
 		previews[i] = content
 	}
-	p.sidebar.SetQueuedMessages(previews)
+	p.sidebar.SetQueuedMessages(previews...)
 }
 
 // processMessage processes a message with the runtime
-func (p *chatPage) processMessage(msg editor.SendMsg) tea.Cmd {
+func (p *chatPage) processMessage(msg msgtypes.SendMsg) tea.Cmd {
 	if p.msgCancel != nil {
 		p.msgCancel()
 	}
@@ -892,6 +893,8 @@ func (p *chatPage) renderResizeHandle(width int) string {
 			workingText = fmt.Sprintf("Working… (%d queued)", queueLen)
 		}
 		suffix := " " + p.spinner.View() + " " + styles.SpinnerDotsHighlightStyle.Render(workingText)
+		cancelKeyPart := styles.HighlightWhiteStyle.Render(p.keyMap.Cancel.Help().Key)
+		suffix += " (" + cancelKeyPart + " to interrupt)"
 		suffixWidth := lipgloss.Width(suffix)
 		truncated := lipgloss.NewStyle().MaxWidth(width - 2 - suffixWidth).Render(fullLine)
 		return truncated + suffix
