@@ -9,6 +9,7 @@ import (
 type (
 	NewSessionMsg                  struct{}
 	ExitSessionMsg                 struct{}
+	ExitAfterFirstResponseMsg      struct{} // Exit TUI after first assistant response completes
 	EvalSessionMsg                 struct{ Filename string }
 	CompactSessionMsg              struct{ AdditionalPrompt string }
 	CopySessionToClipboardMsg      struct{}
@@ -18,6 +19,7 @@ type (
 	ToggleYoloMsg                  struct{}
 	ToggleThinkingMsg              struct{}
 	ToggleHideToolResultsMsg       struct{}
+	ToggleSidebarMsg               struct{} // Toggle sidebar visibility
 	StartShellMsg                  struct{}
 	SwitchAgentMsg                 struct{ AgentName string }
 	OpenSessionBrowserMsg          struct{}

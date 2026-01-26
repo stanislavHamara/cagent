@@ -79,6 +79,28 @@ const (
 	ResumeTypeReject         ResumeType = "reject"
 )
 
+// ResumeRequest carries the user's confirmation decision along with an optional
+// reason (used when rejecting a tool call to help the model understand why).
+type ResumeRequest struct {
+	Type   ResumeType
+	Reason string // Optional; primarily used with ResumeTypeReject
+}
+
+// ResumeApprove creates a ResumeRequest to approve a single tool call.
+func ResumeApprove() ResumeRequest {
+	return ResumeRequest{Type: ResumeTypeApprove}
+}
+
+// ResumeApproveSession creates a ResumeRequest to approve all tool calls for the session.
+func ResumeApproveSession() ResumeRequest {
+	return ResumeRequest{Type: ResumeTypeApproveSession}
+}
+
+// ResumeReject creates a ResumeRequest to reject a tool call with an optional reason.
+func ResumeReject(reason string) ResumeRequest {
+	return ResumeRequest{Type: ResumeTypeReject, Reason: reason}
+}
+
 // ToolHandlerFunc is a function type for handling tool calls
 type ToolHandlerFunc func(ctx context.Context, sess *session.Session, toolCall tools.ToolCall, events chan Event) (*tools.ToolCallResult, error)
 
@@ -108,8 +130,9 @@ type Runtime interface {
 	RunStream(ctx context.Context, sess *session.Session) <-chan Event
 	// Run starts the agent's interaction loop and returns the final messages
 	Run(ctx context.Context, sess *session.Session) ([]session.Message, error)
-	// Resume allows resuming execution after user confirmation
-	Resume(ctx context.Context, confirmationType ResumeType)
+	// Resume allows resuming execution after user confirmation.
+	// The ResumeRequest carries the decision type and an optional reason (for rejections).
+	Resume(ctx context.Context, req ResumeRequest)
 	// ResumeElicitation sends an elicitation response back to a waiting elicitation request
 	ResumeElicitation(_ context.Context, action tools.ElicitationAction, content map[string]any) error
 	// SessionStore returns the session store for browsing/loading past sessions.
@@ -141,7 +164,7 @@ type LocalRuntime struct {
 	toolMap                     map[string]ToolHandler
 	team                        *team.Team
 	currentAgent                string
-	resumeChan                  chan ResumeType
+	resumeChan                  chan ResumeRequest
 	tracer                      trace.Tracer
 	modelsStore                 ModelStore
 	sessionCompaction           bool
@@ -239,7 +262,7 @@ func New(agents *team.Team, opts ...Opt) (*LocalRuntime, error) {
 		toolMap:              make(map[string]ToolHandler),
 		team:                 agents,
 		currentAgent:         defaultAgent.Name(),
-		resumeChan:           make(chan ResumeType),
+		resumeChan:           make(chan ResumeRequest),
 		elicitationRequestCh: make(chan ElicitationResult),
 		modelsStore:          modelsStore,
 		sessionCompaction:    true,
@@ -500,22 +523,6 @@ func getAgentModelID(a *agent.Agent) string {
 	return ""
 }
 
-// isModelThinkingDisabled checks if the model's thinking configuration is explicitly disabled
-// (thinking_budget: 0 or thinking_budget: none).
-func isModelThinkingDisabled(model provider.Provider) bool {
-	if model == nil {
-		return false
-	}
-	tb := model.BaseConfig().ModelConfig.ThinkingBudget
-	if tb == nil {
-		return false
-	}
-	if tb.Effort == "none" {
-		return true
-	}
-	return tb.Tokens == 0 && tb.Effort == ""
-}
-
 // agentDetailsFromTeam converts team agent info to AgentDetails for events
 func (r *LocalRuntime) agentDetailsFromTeam() []AgentDetails {
 	agentsInfo := r.team.AgentsInfo()
@@ -554,37 +561,58 @@ func (r *LocalRuntime) EmitStartupInfo(ctx context.Context, events chan Event) {
 
 	a := r.CurrentAgent()
 
+	// Helper to send events with context check
+	send := func(event Event) bool {
+		select {
+		case events <- event:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	// Emit agent and team information immediately for fast sidebar display
-	events <- AgentInfo(a.Name(), getAgentModelID(a), a.Description(), a.WelcomeMessage())
-	events <- TeamInfo(r.agentDetailsFromTeam(), r.currentAgent)
+	if !send(AgentInfo(a.Name(), getAgentModelID(a), a.Description(), a.WelcomeMessage())) {
+		return
+	}
+	if !send(TeamInfo(r.agentDetailsFromTeam(), r.currentAgent)) {
+		return
+	}
 
 	// Emit agent warnings (if any) - these are quick
-	r.emitAgentWarnings(a, events)
+	r.emitAgentWarningsWithSend(a, send)
 
 	// Tool loading can be slow (MCP servers need to start)
 	// Emit progressive updates as each toolset loads
-	r.emitToolsProgressively(ctx, a, events)
+	r.emitToolsProgressively(ctx, a, send)
 }
 
 // emitToolsProgressively loads tools from each toolset and emits progress updates.
 // This allows the UI to show the tool count incrementally as each toolset loads,
 // with a spinner indicating that more tools may be coming.
-func (r *LocalRuntime) emitToolsProgressively(ctx context.Context, a *agent.Agent, events chan Event) {
+func (r *LocalRuntime) emitToolsProgressively(ctx context.Context, a *agent.Agent, send func(Event) bool) {
 	toolsets := a.ToolSets()
 	totalToolsets := len(toolsets)
 
 	// If no toolsets, emit final state immediately
 	if totalToolsets == 0 {
-		events <- ToolsetInfo(0, false, r.currentAgent)
+		send(ToolsetInfo(0, false, r.currentAgent))
 		return
 	}
 
 	// Emit initial loading state
-	events <- ToolsetInfo(0, true, r.currentAgent)
+	if !send(ToolsetInfo(0, true, r.currentAgent)) {
+		return
+	}
 
 	// Load tools from each toolset and emit progress
 	var totalTools int
 	for i, toolset := range toolsets {
+		// Check context before potentially slow operations
+		if ctx.Err() != nil {
+			return
+		}
+
 		isLast := i == totalToolsets-1
 
 		// Start the toolset if needed
@@ -607,11 +635,13 @@ func (r *LocalRuntime) emitToolsProgressively(ctx context.Context, a *agent.Agen
 		totalTools += len(ts)
 
 		// Emit progress update - still loading unless this is the last toolset
-		events <- ToolsetInfo(totalTools, !isLast, r.currentAgent)
+		if !send(ToolsetInfo(totalTools, !isLast, r.currentAgent)) {
+			return
+		}
 	}
 
 	// Emit final state (not loading)
-	events <- ToolsetInfo(totalTools, false, r.currentAgent)
+	send(ToolsetInfo(totalTools, false, r.currentAgent))
 }
 
 // registerDefaultTools registers the default tool handlers
@@ -726,34 +756,50 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 			// Check iteration limit
 			if runtimeMaxIterations > 0 && iteration >= runtimeMaxIterations {
-				slog.Debug("Maximum iterations reached", "agent", a.Name(), "iterations", iteration, "max", runtimeMaxIterations)
+				slog.Debug(
+					"Maximum iterations reached",
+					"agent", a.Name(),
+					"iterations", iteration,
+					"max", runtimeMaxIterations,
+				)
+
 				events <- MaxIterationsReached(runtimeMaxIterations)
 
-				// Wait for user decision
+				// Wait for user decision (resume / reject)
 				select {
-				case resumeType := <-r.resumeChan:
-					if resumeType == ResumeTypeApprove {
+				case req := <-r.resumeChan:
+					if req.Type == ResumeTypeApprove {
 						slog.Debug("User chose to continue after max iterations", "agent", a.Name())
 						runtimeMaxIterations = iteration + 10
 					} else {
-						slog.Debug("User chose to exit after max iterations", "agent", a.Name())
-						// Synthesize a final assistant message so callers (e.g., parent agents)
-						// receive a non-empty response and providers are not given empty tool outputs.
+						slog.Debug("User rejected continuation", "agent", a.Name())
+
 						assistantMessage := chat.Message{
-							Role:      chat.MessageRoleAssistant,
-							Content:   fmt.Sprintf("I have reached the maximum number of iterations (%d). Stopping as requested by user.", runtimeMaxIterations),
+							Role: chat.MessageRoleAssistant,
+							Content: fmt.Sprintf(
+								"Execution stopped after reaching the configured max_iterations limit (%d).",
+								runtimeMaxIterations,
+							),
 							CreatedAt: time.Now().Format(time.RFC3339),
 						}
+
 						sess.AddMessage(session.NewAgentMessage(a, &assistantMessage))
 						r.saveSession(ctx, sess)
 						return
 					}
+
 				case <-ctx.Done():
-					slog.Debug("Context cancelled while waiting for max iterations decision", "agent", a.Name())
+					slog.Debug(
+						"Context cancelled while waiting for resume confirmation",
+						"agent", a.Name(),
+						"session_id", sess.ID,
+					)
 					return
 				}
 			}
+
 			iteration++
+
 			// Exit immediately if the stream context has been cancelled (e.g., Ctrl+C)
 			if err := ctx.Err(); err != nil {
 				slog.Debug("Runtime stream context cancelled, stopping loop", "agent", a.Name(), "session_id", sess.ID)
@@ -768,16 +814,19 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 			model := a.Model()
 
-			// If thinking is disabled for this session, clone the provider with thinking disabled
+			// Apply thinking setting based on session state.
+			// When thinking is disabled: clone with thinking=false to clear any thinking config.
+			// When thinking is enabled: clone with thinking=true to ensure defaults are applied
+			// (this handles models with no thinking config, explicitly disabled thinking, or
+			// models that already have thinking configured).
 			if !sess.Thinking {
 				model = provider.CloneWithOptions(ctx, model, options.WithThinking(false))
 				slog.Debug("Cloned provider with thinking disabled", "agent", a.Name(), "model", model.ID())
-			} else if isModelThinkingDisabled(model) {
-				// If thinking is enabled for this session but the model config has it disabled
-				// (e.g., thinking_budget: 0 or thinking_budget: none), clone with explicit enable
-				// so that applyOverrides restores provider defaults.
+			} else {
+				// Always clone with thinking=true when session has thinking enabled.
+				// applyOverrides will apply provider defaults if ThinkingBudget is nil or disabled.
 				model = provider.CloneWithOptions(ctx, model, options.WithThinking(true))
-				slog.Debug("Cloned provider with thinking enabled (restoring defaults)", "agent", a.Name(), "model", model.ID())
+				slog.Debug("Cloned provider with thinking enabled", "agent", a.Name(), "model", model.ID())
 			}
 
 			modelID := model.ID()
@@ -955,6 +1004,17 @@ func (r *LocalRuntime) configureToolsetHandlers(a *agent.Agent, events chan Even
 	}
 }
 
+// emitAgentWarningsWithSend emits agent warnings using the provided send function for context-aware sending.
+func (r *LocalRuntime) emitAgentWarningsWithSend(a *agent.Agent, send func(Event) bool) {
+	warnings := a.DrainWarnings()
+	if len(warnings) == 0 {
+		return
+	}
+
+	slog.Warn("Tool setup partially failed; continuing", "agent", a.Name(), "warnings", warnings)
+	send(Warning(formatToolWarning(a, warnings), r.currentAgent))
+}
+
 func (r *LocalRuntime) emitAgentWarnings(a *agent.Agent, events chan Event) {
 	warnings := a.DrainWarnings()
 	if len(warnings) == 0 {
@@ -977,14 +1037,39 @@ func formatToolWarning(a *agent.Agent, warnings []string) string {
 	return strings.TrimSuffix(builder.String(), "\n")
 }
 
-func (r *LocalRuntime) Resume(_ context.Context, confirmationType ResumeType) {
-	slog.Debug("Resuming runtime", "agent", r.currentAgent, "confirmation_type", confirmationType)
+func (r *LocalRuntime) Resume(_ context.Context, req ResumeRequest) {
+	slog.Debug("Resuming runtime", "agent", r.currentAgent, "type", req.Type, "reason", req.Reason)
 
+	// Defensive validation:
+	//
+	// The runtime may be resumed by multiple entry points (API, CLI, TUI, tests).
+	// Even if upstream layers perform validation, the runtime must never assume
+	// the ResumeType is valid. Accepting invalid values here leads to confusing
+	// downstream behavior where tool execution fails without a clear cause.
+	if !IsValidResumeType(req.Type) {
+		slog.Warn(
+			"Invalid resume type received; ignoring resume request",
+			"agent", r.currentAgent,
+			"confirmation_type", req.Type,
+			"valid_types", ValidResumeTypes(),
+		)
+		return
+	}
+
+	// Attempt to deliver the resume signal to the execution loop.
+	//
+	// The channel is non-blocking by design to avoid deadlocks if the runtime
+	// is not currently waiting for a confirmation (e.g. already resumed,
+	// canceled, or shutting down).
 	select {
-	case r.resumeChan <- confirmationType:
+	case r.resumeChan <- req:
 		slog.Debug("Resume signal sent", "agent", r.currentAgent)
 	default:
-		slog.Debug("Resume channel not ready, ignoring", "agent", r.currentAgent)
+		slog.Debug(
+			"Resume channel not ready; resume signal dropped",
+			"agent", r.currentAgent,
+			"confirmation_type", req.Type,
+		)
 	}
 }
 
@@ -1384,8 +1469,8 @@ func (r *LocalRuntime) executeWithApproval(
 	events <- ToolCallConfirmation(toolCall, tool, a.Name())
 
 	select {
-	case cType := <-r.resumeChan:
-		switch cType {
+	case req := <-r.resumeChan:
+		switch req.Type {
 		case ResumeTypeApprove:
 			slog.Debug("Resume signal received, approving tool", "tool", toolCall.Function.Name, "session_id", sess.ID)
 			runTool()
@@ -1394,8 +1479,12 @@ func (r *LocalRuntime) executeWithApproval(
 			sess.ToolsApproved = true
 			runTool()
 		case ResumeTypeReject:
-			slog.Debug("Resume signal received, rejecting tool", "tool", toolCall.Function.Name, "session_id", sess.ID)
-			r.addToolErrorResponse(ctx, sess, toolCall, tool, events, a, "The user rejected the tool call.")
+			slog.Debug("Resume signal received, rejecting tool", "tool", toolCall.Function.Name, "session_id", sess.ID, "reason", req.Reason)
+			rejectMsg := "The user rejected the tool call."
+			if strings.TrimSpace(req.Reason) != "" {
+				rejectMsg += " Reason: " + strings.TrimSpace(req.Reason)
+			}
+			r.addToolErrorResponse(ctx, sess, toolCall, tool, events, a, rejectMsg)
 		}
 		return false
 	case <-ctx.Done():
