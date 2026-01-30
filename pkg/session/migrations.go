@@ -300,12 +300,6 @@ func getAllMigrations() []Migration {
 			Description: "Migrate existing messages JSON data to session_items table",
 			UpFunc:      migrateMessagesToSessionItems,
 		},
-		{
-			ID:          16,
-			Name:        "016_drop_messages_column",
-			Description: "Remove the legacy messages JSON column from sessions table",
-			UpSQL:       `ALTER TABLE sessions DROP COLUMN messages`,
-		},
 	}
 }
 
