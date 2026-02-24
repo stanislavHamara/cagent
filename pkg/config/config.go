@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"slices"
 	"strings"
@@ -15,11 +16,7 @@ import (
 	"github.com/docker/cagent/pkg/environment"
 )
 
-type Reader interface {
-	Read(ctx context.Context) ([]byte, error)
-}
-
-func Load(ctx context.Context, source Reader) (*latest.Config, error) {
+func Load(ctx context.Context, source Source) (*latest.Config, error) {
 	data, err := source.Read(ctx)
 	if err != nil {
 		return nil, err
@@ -73,9 +70,10 @@ func CheckRequiredEnvVars(ctx context.Context, cfg *latest.Config, modelsGateway
 }
 
 func parseCurrentVersion(data []byte, version string) (any, error) {
-	parser, found := Parsers()[version]
+	parsers, _ := versions()
+	parser, found := parsers[version]
 	if !found {
-		return nil, fmt.Errorf("unsupported config version: %v", version)
+		return nil, fmt.Errorf("unsupported config version: %v (valid versions: %s)", version, strings.Join(slices.Sorted(maps.Keys(parsers)), ", "))
 	}
 	return parser(data)
 }
@@ -83,7 +81,8 @@ func parseCurrentVersion(data []byte, version string) (any, error) {
 func migrateToLatestConfig(c any, raw []byte) (latest.Config, error) {
 	var err error
 
-	for _, upgrade := range Upgrades() {
+	_, upgraders := versions()
+	for _, upgrade := range upgraders {
 		c, err = upgrade(c, raw)
 		if err != nil {
 			return latest.Config{}, err
@@ -105,7 +104,7 @@ func validateConfig(cfg *latest.Config) error {
 	for name := range cfg.Models {
 		if cfg.Models[name].ParallelToolCalls == nil {
 			m := cfg.Models[name]
-			m.ParallelToolCalls = boolPtr(true)
+			m.ParallelToolCalls = new(true)
 			cfg.Models[name] = m
 		}
 	}
@@ -132,10 +131,6 @@ func validateConfig(cfg *latest.Config) error {
 	}
 
 	return nil
-}
-
-func boolPtr(b bool) *bool {
-	return &b
 }
 
 // providerAPITypes are the allowed values for api_type in provider configs
@@ -191,43 +186,19 @@ func validateProviderName(name string) error {
 	return nil
 }
 
-// validateSkillsConfiguration ensures that agents with skills enabled have the necessary tools
-func validateSkillsConfiguration(agentName string, agent *latest.AgentConfig) error {
-	// Check if skills are enabled
-	if agent.Skills == nil || !*agent.Skills {
-		return nil
-	}
-
-	// Skills are enabled, validate toolsets
-	hasFilesystemToolset := false
-	hasReadFileTool := false
-
-	for _, toolset := range agent.Toolsets {
-		if toolset.Type == "filesystem" {
-			hasFilesystemToolset = true
-
-			// Check if read_file tool is enabled
-			// If no specific tools are listed, all tools are enabled
-			if len(toolset.Tools) == 0 {
-				hasReadFileTool = true
-				break
+// validateSkillsConfiguration validates the skills configuration for an agent.
+func validateSkillsConfiguration(_ string, agent *latest.AgentConfig) error {
+	for _, source := range agent.Skills.Sources {
+		switch {
+		case source == latest.SkillSourceLocal:
+			// valid
+		case strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://"):
+			if _, err := url.Parse(source); err != nil {
+				return fmt.Errorf("agent '%s' has invalid skills source URL '%s': %w", agent.Name, source, err)
 			}
-
-			// Check if read_file is in the tools list
-			if slices.Contains(toolset.Tools, "read_file") {
-				hasReadFileTool = true
-				break
-			}
+		default:
+			return fmt.Errorf("agent '%s' has unknown skills source '%s' (must be 'local' or an HTTP/HTTPS URL)", agent.Name, source)
 		}
 	}
-
-	if !hasFilesystemToolset {
-		return fmt.Errorf("agent '%s' has skills enabled but does not have a 'filesystem' toolset configured", agentName)
-	}
-
-	if !hasReadFileTool {
-		return fmt.Errorf("agent '%s' has skills enabled but the 'filesystem' toolset does not include the 'read_file' tool", agentName)
-	}
-
 	return nil
 }

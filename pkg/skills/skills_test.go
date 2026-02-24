@@ -233,46 +233,6 @@ func TestLoadSkillsFromDir_NonExistentDir(t *testing.T) {
 	assert.Empty(t, skills)
 }
 
-func TestBuildSkillsPrompt(t *testing.T) {
-	skills := []Skill{
-		{
-			Name:        "pdf-extractor",
-			Description: "Extract text from PDFs",
-			FilePath:    "/home/user/.claude/skills/pdf-extractor/SKILL.md",
-			BaseDir:     "/home/user/.claude/skills/pdf-extractor",
-		},
-		{
-			Name:        "code-review",
-			Description: "Perform code reviews",
-			FilePath:    "/project/.claude/skills/code-review/SKILL.md",
-			BaseDir:     "/project/.claude/skills/code-review",
-		},
-	}
-
-	prompt := BuildSkillsPrompt(skills)
-
-	assert.Contains(t, prompt, "<available_skills>")
-	assert.Contains(t, prompt, "</available_skills>")
-	assert.Contains(t, prompt, "<skill>")
-	assert.Contains(t, prompt, "</skill>")
-	assert.Contains(t, prompt, "<name>pdf-extractor</name>")
-	assert.Contains(t, prompt, "<description>Extract text from PDFs</description>")
-	assert.Contains(t, prompt, "<location>/home/user/.claude/skills/pdf-extractor/SKILL.md</location>")
-	assert.Contains(t, prompt, "<name>code-review</name>")
-	assert.Contains(t, prompt, "<description>Perform code reviews</description>")
-	assert.Contains(t, prompt, "<location>/project/.claude/skills/code-review/SKILL.md</location>")
-	assert.Contains(t, prompt, "use the read_file tool to load the skill's SKILL.md file")
-	assert.Contains(t, prompt, "description indicates what it does and when to use it")
-}
-
-func TestBuildSkillsPrompt_Empty(t *testing.T) {
-	prompt := BuildSkillsPrompt(nil)
-	assert.Empty(t, prompt)
-
-	prompt = BuildSkillsPrompt([]Skill{})
-	assert.Empty(t, prompt)
-}
-
 func TestLoad_Integration(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
@@ -289,7 +249,7 @@ description: Test project skill
 `
 	require.NoError(t, os.WriteFile(filepath.Join(claudeProjectDir, "SKILL.md"), []byte(skillContent), 0o644))
 
-	skills := Load()
+	skills := Load([]string{"local"})
 
 	found := false
 	for _, s := range skills {
@@ -300,4 +260,317 @@ description: Test project skill
 		}
 	}
 	assert.True(t, found, "Expected to find test-skill from project directory")
+}
+
+func TestLoad_AgentsSkillsGlobal(t *testing.T) {
+	// Create a temp home directory with .agents/skills
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	agentsSkillDir := filepath.Join(tmpHome, ".agents", "skills", "global-skill")
+	require.NoError(t, os.MkdirAll(agentsSkillDir, 0o755))
+
+	skillContent := `---
+name: global-skill
+description: A global agents skill
+---
+
+# Global Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsSkillDir, "SKILL.md"), []byte(skillContent), 0o644))
+
+	// Change to a temp directory that doesn't have any skills
+	tmpCwd := t.TempDir()
+	t.Chdir(tmpCwd)
+
+	skills := Load([]string{"local"})
+
+	found := false
+	for _, s := range skills {
+		if s.Name == "global-skill" {
+			found = true
+			assert.Equal(t, "A global agents skill", s.Description)
+			assert.Equal(t, filepath.Join(agentsSkillDir, "SKILL.md"), s.FilePath)
+			break
+		}
+	}
+	assert.True(t, found, "Expected to find global-skill from ~/.agents/skills")
+}
+
+func TestLoad_AgentsSkillsGlobalRecursive(t *testing.T) {
+	// Create a temp home directory with nested .agents/skills
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create a deeply nested skill under ~/.agents/skills/
+	nestedSkillDir := filepath.Join(tmpHome, ".agents", "skills", "project-a", "skill-one")
+	require.NoError(t, os.MkdirAll(nestedSkillDir, 0o755))
+
+	skillContent := `---
+name: skill-one
+description: A nested global agents skill
+---
+
+# Nested Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(nestedSkillDir, "SKILL.md"), []byte(skillContent), 0o644))
+
+	// Also create a flat skill to make sure both work
+	flatSkillDir := filepath.Join(tmpHome, ".agents", "skills", "flat-skill")
+	require.NoError(t, os.MkdirAll(flatSkillDir, 0o755))
+
+	flatContent := `---
+name: flat-skill
+description: A flat global agents skill
+---
+
+# Flat Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(flatSkillDir, "SKILL.md"), []byte(flatContent), 0o644))
+
+	// Change to a temp directory that doesn't have any skills
+	tmpCwd := t.TempDir()
+	t.Chdir(tmpCwd)
+
+	skills := Load([]string{"local"})
+
+	// Both nested and flat skills should be found
+	foundNested := false
+	foundFlat := false
+	for _, s := range skills {
+		switch s.Name {
+		case "skill-one":
+			foundNested = true
+			assert.Equal(t, "A nested global agents skill", s.Description)
+			assert.Equal(t, filepath.Join(nestedSkillDir, "SKILL.md"), s.FilePath)
+		case "flat-skill":
+			foundFlat = true
+			assert.Equal(t, "A flat global agents skill", s.Description)
+			assert.Equal(t, filepath.Join(flatSkillDir, "SKILL.md"), s.FilePath)
+		}
+	}
+	assert.True(t, foundNested, "Expected to find nested skill-one from ~/.agents/skills/project-a/skill-one")
+	assert.True(t, foundFlat, "Expected to find flat-skill from ~/.agents/skills/flat-skill")
+}
+
+func TestLoad_AgentsSkillsProjectFromNestedDir(t *testing.T) {
+	// Create a fake git repo with .agents/skills at the root
+	tmpRepo := t.TempDir()
+
+	// Create .git directory to mark as git root
+	require.NoError(t, os.Mkdir(filepath.Join(tmpRepo, ".git"), 0o755))
+
+	// Create .agents/skills at repo root
+	agentsSkillDir := filepath.Join(tmpRepo, ".agents", "skills", "repo-skill")
+	require.NoError(t, os.MkdirAll(agentsSkillDir, 0o755))
+
+	skillContent := `---
+name: repo-skill
+description: A skill from repo root
+---
+
+# Repo Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsSkillDir, "SKILL.md"), []byte(skillContent), 0o644))
+
+	// Create a nested directory and chdir there
+	nestedDir := filepath.Join(tmpRepo, "sub", "nested", "deep")
+	require.NoError(t, os.MkdirAll(nestedDir, 0o755))
+	t.Chdir(nestedDir)
+
+	// Set HOME to a directory without skills to isolate test
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	skills := Load([]string{"local"})
+
+	found := false
+	for _, s := range skills {
+		if s.Name == "repo-skill" {
+			found = true
+			assert.Equal(t, "A skill from repo root", s.Description)
+			assert.Equal(t, filepath.Join(agentsSkillDir, "SKILL.md"), s.FilePath)
+			break
+		}
+	}
+	assert.True(t, found, "Expected to find repo-skill from .agents/skills at git root")
+}
+
+func TestLoad_AgentsSkillsPrecedence_ProjectOverridesGlobal(t *testing.T) {
+	// Create a temp home directory with a global skill
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	globalSkillDir := filepath.Join(tmpHome, ".agents", "skills", "shared-skill")
+	require.NoError(t, os.MkdirAll(globalSkillDir, 0o755))
+
+	globalContent := `---
+name: shared-skill
+description: Global version of shared skill
+---
+
+# Global Version
+`
+	require.NoError(t, os.WriteFile(filepath.Join(globalSkillDir, "SKILL.md"), []byte(globalContent), 0o644))
+
+	// Create a project with the same skill name
+	tmpRepo := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(tmpRepo, ".git"), 0o755))
+
+	projectSkillDir := filepath.Join(tmpRepo, ".agents", "skills", "shared-skill")
+	require.NoError(t, os.MkdirAll(projectSkillDir, 0o755))
+
+	projectContent := `---
+name: shared-skill
+description: Project version of shared skill
+---
+
+# Project Version
+`
+	require.NoError(t, os.WriteFile(filepath.Join(projectSkillDir, "SKILL.md"), []byte(projectContent), 0o644))
+
+	t.Chdir(tmpRepo)
+
+	skills := Load([]string{"local"})
+
+	found := false
+	for _, s := range skills {
+		if s.Name == "shared-skill" {
+			found = true
+			// Project should win over global
+			assert.Equal(t, "Project version of shared skill", s.Description)
+			assert.Equal(t, filepath.Join(projectSkillDir, "SKILL.md"), s.FilePath)
+			break
+		}
+	}
+	assert.True(t, found, "Expected to find shared-skill")
+}
+
+func TestLoad_AgentsSkillsPrecedence_CloserDirWins(t *testing.T) {
+	// Create a git repo with skills at both root and a subdirectory
+	tmpRepo := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(tmpRepo, ".git"), 0o755))
+
+	// Skill at repo root
+	rootSkillDir := filepath.Join(tmpRepo, ".agents", "skills", "local-skill")
+	require.NoError(t, os.MkdirAll(rootSkillDir, 0o755))
+
+	rootContent := `---
+name: local-skill
+description: Root version
+---
+
+# Root
+`
+	require.NoError(t, os.WriteFile(filepath.Join(rootSkillDir, "SKILL.md"), []byte(rootContent), 0o644))
+
+	// Same skill in a subdirectory
+	subDir := filepath.Join(tmpRepo, "subproject")
+	require.NoError(t, os.MkdirAll(subDir, 0o755))
+
+	subSkillDir := filepath.Join(subDir, ".agents", "skills", "local-skill")
+	require.NoError(t, os.MkdirAll(subSkillDir, 0o755))
+
+	subContent := `---
+name: local-skill
+description: Subproject version
+---
+
+# Subproject
+`
+	require.NoError(t, os.WriteFile(filepath.Join(subSkillDir, "SKILL.md"), []byte(subContent), 0o644))
+
+	// Set HOME to empty dir
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// From repo root, should get root version
+	t.Chdir(tmpRepo)
+	skills := Load([]string{"local"})
+	for _, s := range skills {
+		if s.Name == "local-skill" {
+			assert.Equal(t, "Root version", s.Description)
+			break
+		}
+	}
+
+	// From subproject, should get subproject version (closer wins)
+	t.Chdir(subDir)
+	skills = Load([]string{"local"})
+	for _, s := range skills {
+		if s.Name == "local-skill" {
+			assert.Equal(t, "Subproject version", s.Description)
+			break
+		}
+	}
+}
+
+func TestFindGitRoot(t *testing.T) {
+	t.Run("git directory at current", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(tmpDir, ".git"), 0o755))
+		got := findGitRoot(tmpDir)
+		assert.Equal(t, tmpDir, got)
+	})
+
+	t.Run("git directory at parent", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(tmpDir, ".git"), 0o755))
+		nestedDir := filepath.Join(tmpDir, "sub", "nested")
+		require.NoError(t, os.MkdirAll(nestedDir, 0o755))
+		got := findGitRoot(nestedDir)
+		assert.Equal(t, tmpDir, got)
+	})
+
+	t.Run("git file (worktree)", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// .git as a file (like in worktrees)
+		require.NoError(t, os.WriteFile(filepath.Join(tmpDir, ".git"), []byte("gitdir: /somewhere/else/.git"), 0o644))
+		got := findGitRoot(tmpDir)
+		assert.Equal(t, tmpDir, got)
+	})
+
+	t.Run("no git repo", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		got := findGitRoot(tmpDir)
+		assert.Empty(t, got)
+	})
+}
+
+func TestProjectSearchDirs(t *testing.T) {
+	t.Run("in git repo", func(t *testing.T) {
+		tmpRepo := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(tmpRepo, ".git"), 0o755))
+
+		nestedDir := filepath.Join(tmpRepo, "a", "b", "c")
+		require.NoError(t, os.MkdirAll(nestedDir, 0o755))
+
+		dirs := projectSearchDirs(nestedDir)
+
+		// Should be ordered from root to nested (root first, nested last)
+		require.Len(t, dirs, 4)
+		assert.Equal(t, tmpRepo, dirs[0])
+		assert.Equal(t, filepath.Join(tmpRepo, "a"), dirs[1])
+		assert.Equal(t, filepath.Join(tmpRepo, "a", "b"), dirs[2])
+		assert.Equal(t, filepath.Join(tmpRepo, "a", "b", "c"), dirs[3])
+	})
+
+	t.Run("not in git repo", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		dirs := projectSearchDirs(tmpDir)
+
+		require.Len(t, dirs, 1)
+		assert.Equal(t, tmpDir, dirs[0])
+	})
+
+	t.Run("at git root", func(t *testing.T) {
+		tmpRepo := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(tmpRepo, ".git"), 0o755))
+
+		dirs := projectSearchDirs(tmpRepo)
+
+		require.Len(t, dirs, 1)
+		assert.Equal(t, tmpRepo, dirs[0])
+	})
 }

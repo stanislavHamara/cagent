@@ -20,18 +20,52 @@ type Skill struct {
 	Description   string            `yaml:"description"`
 	FilePath      string            `yaml:"-"`
 	BaseDir       string            `yaml:"-"`
+	Files         []string          `yaml:"-"`
 	License       string            `yaml:"license"`
 	Compatibility string            `yaml:"compatibility"`
 	Metadata      map[string]string `yaml:"metadata"`
 	AllowedTools  []string          `yaml:"allowed-tools"`
 }
 
-// Load discovers and loads all skills from standard locations.
-// Skills are loaded from (in order, later overrides earlier):
+// Load discovers and loads skills from the given sources.
+// Each source is either "local" (for filesystem-based skills) or an HTTP/HTTPS URL
+// (for remote skills per the well-known skills discovery spec).
+//
+// Local skills are loaded from (in order, later overrides earlier):
+//
+// Global locations (from home directory):
 //   - ~/.codex/skills/ (recursive)
 //   - ~/.claude/skills/ (flat)
-//   - ./.claude/skills/ (flat, project-local)
-func Load() []Skill {
+//   - ~/.agents/skills/ (recursive)
+//
+// Project locations (from git root up to cwd, closest wins):
+//   - .claude/skills/ (flat, only at cwd)
+//   - .agents/skills/ (flat, scanned from git root to cwd)
+func Load(sources []string) []Skill {
+	skillMap := make(map[string]Skill)
+
+	for _, source := range sources {
+		switch {
+		case source == "local":
+			for _, skill := range loadLocalSkills() {
+				skillMap[skill.Name] = skill
+			}
+		case strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://"):
+			for _, skill := range loadRemoteSkills(source) {
+				skillMap[source+"/"+skill.Name] = skill
+			}
+		}
+	}
+
+	result := make([]Skill, 0, len(skillMap))
+	for _, skill := range skillMap {
+		result = append(result, skill)
+	}
+	return result
+}
+
+// loadLocalSkills loads skills from standard filesystem locations.
+func loadLocalSkills() []Skill {
 	skillMap := make(map[string]Skill)
 
 	homeDir := paths.GetHomeDir()
@@ -44,12 +78,25 @@ func Load() []Skill {
 		for _, skill := range loadSkillsFromDir(filepath.Join(homeDir, ".claude", "skills"), false) {
 			skillMap[skill.Name] = skill
 		}
+		// Load from agents user directory (recursive)
+		for _, skill := range loadSkillsFromDir(filepath.Join(homeDir, ".agents", "skills"), true) {
+			skillMap[skill.Name] = skill
+		}
 	}
 
-	// Load from project directory (flat)
+	// Load from project directories
 	if cwd, err := os.Getwd(); err == nil {
+		// Load .claude/skills from cwd only (backward compatibility)
 		for _, skill := range loadSkillsFromDir(filepath.Join(cwd, ".claude", "skills"), false) {
 			skillMap[skill.Name] = skill
+		}
+
+		// Load .agents/skills from git root up to cwd (closest wins)
+		// We iterate from root to cwd so that later (closer) directories override earlier ones
+		for _, dir := range projectSearchDirs(cwd) {
+			for _, skill := range loadSkillsFromDir(filepath.Join(dir, ".agents", "skills"), false) {
+				skillMap[skill.Name] = skill
+			}
 		}
 	}
 
@@ -60,35 +107,67 @@ func Load() []Skill {
 	return result
 }
 
-// BuildSkillsPrompt generates a prompt section describing available skills.
-func BuildSkillsPrompt(skills []Skill) string {
-	if len(skills) == 0 {
-		return ""
+// projectSearchDirs returns directories from git root to cwd (inclusive).
+// If not in a git repo, returns only cwd.
+// The returned slice is ordered from root to cwd so that closer directories
+// can override skills from parent directories.
+func projectSearchDirs(cwd string) []string {
+	absPath, err := filepath.Abs(cwd)
+	if err != nil {
+		return []string{cwd}
 	}
 
-	var sb strings.Builder
-	sb.WriteString("The following skills provide specialized instructions for specific tasks. ")
-	sb.WriteString("Each skill's description indicates what it does and when to use it.\n\n")
-	sb.WriteString("When a user's request matches a skill's description, use the read_file tool to load the skill's SKILL.md file from the location path. ")
-	sb.WriteString("The file contains detailed instructions to follow for that task.\n\n")
-
-	sb.WriteString("\n\n<available_skills>\n")
-	for _, skill := range skills {
-		sb.WriteString("  <skill>\n")
-		sb.WriteString("    <name>")
-		sb.WriteString(skill.Name)
-		sb.WriteString("</name>\n")
-		sb.WriteString("    <description>")
-		sb.WriteString(skill.Description)
-		sb.WriteString("</description>\n")
-		sb.WriteString("    <location>")
-		sb.WriteString(skill.FilePath)
-		sb.WriteString("</location>\n")
-		sb.WriteString("  </skill>\n")
+	// Find git root by walking up
+	gitRoot := findGitRoot(absPath)
+	if gitRoot == "" {
+		// Not in a git repo, just return cwd
+		return []string{absPath}
 	}
-	sb.WriteString("</available_skills>")
 
-	return sb.String()
+	// Build list of directories from git root to cwd
+	var dirs []string
+	current := absPath
+	for {
+		dirs = append(dirs, current)
+		if current == gitRoot {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached filesystem root without finding git root (shouldn't happen)
+			break
+		}
+		current = parent
+	}
+
+	// Reverse so we go from root to cwd (earlier entries get overridden by later)
+	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
+		dirs[i], dirs[j] = dirs[j], dirs[i]
+	}
+
+	return dirs
+}
+
+// findGitRoot finds the git repository root by looking for .git directory or file.
+// Returns empty string if not in a git repository.
+func findGitRoot(dir string) string {
+	current := dir
+	for {
+		gitPath := filepath.Join(current, ".git")
+		if info, err := os.Stat(gitPath); err == nil {
+			// .git can be a directory (normal repo) or a file (worktree/submodule)
+			if info.IsDir() || info.Mode().IsRegular() {
+				return current
+			}
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached filesystem root
+			return ""
+		}
+		current = parent
+	}
 }
 
 // loadSkillsFromDir loads skills from a directory.
