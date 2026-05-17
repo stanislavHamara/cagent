@@ -1,16 +1,15 @@
 package editfile
 
 import (
-	"encoding/json"
 	"fmt"
 
-	"github.com/docker/cagent/pkg/tools/builtin"
-	"github.com/docker/cagent/pkg/tui/components/spinner"
-	"github.com/docker/cagent/pkg/tui/components/toolcommon"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/styles"
-	"github.com/docker/cagent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/tools/builtin/filesystem"
+	"github.com/docker/docker-agent/pkg/tui/components/spinner"
+	"github.com/docker/docker-agent/pkg/tui/components/toolcommon"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	"github.com/docker/docker-agent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/types"
 )
 
 type ToggleDiffViewMsg struct{}
@@ -32,8 +31,8 @@ func render(
 	_ int,
 ) string {
 	// Parse tool arguments to extract the file path for display.
-	var args builtin.EditFileArgs
-	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &args); err != nil {
+	args, err := filesystem.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
+	if err != nil {
 		// If arguments cannot be parsed, fail silently to avoid breaking the TUI.
 		return ""
 	}
@@ -111,8 +110,8 @@ func renderCollapsed(
 	width,
 	_ int,
 ) string {
-	var args builtin.EditFileArgs
-	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &args); err != nil {
+	args, err := filesystem.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
+	if err != nil {
 		return ""
 	}
 

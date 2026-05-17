@@ -5,10 +5,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/docker/cagent/pkg/acp"
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/paths"
-	"github.com/docker/cagent/pkg/telemetry"
+	"github.com/docker/docker-agent/pkg/acp"
+	"github.com/docker/docker-agent/pkg/config"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/paths"
+	"github.com/docker/docker-agent/pkg/telemetry"
 )
 
 type acpFlags struct {
@@ -23,9 +24,9 @@ func newACPCmd() *cobra.Command {
 		Use:   "acp <agent-file>|<registry-ref>",
 		Short: "Start an agent as an ACP (Agent Client Protocol) server",
 		Long:  "Start an ACP server that exposes the agent via the Agent Client Protocol",
-		Example: `  cagent serve acp ./agent.yaml
-  cagent serve acp ./team.yaml
-  cagent serve acp agentcatalog/pirate`,
+		Example: `  docker-agent serve acp ./agent.yaml
+  docker-agent serve acp ./team.yaml
+  docker-agent serve acp agentcatalog/pirate`,
 		Args: cobra.ExactArgs(1),
 		RunE: flags.runACPCommand,
 	}
@@ -36,14 +37,17 @@ func newACPCmd() *cobra.Command {
 	return cmd
 }
 
-func (f *acpFlags) runACPCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("serve", append([]string{"acp"}, args...))
-
+func (f *acpFlags) runACPCommand(cmd *cobra.Command, args []string) (commandErr error) {
 	ctx := cmd.Context()
+	telemetry.TrackCommand(ctx, "serve", append([]string{"acp"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(ctx, "serve", append([]string{"acp"}, args...), commandErr)
+	}()
+
 	agentFilename := args[0]
 
 	// Expand tilde in session database path
-	sessionDB, err := expandTilde(f.sessionDB)
+	sessionDB, err := pathx.ExpandHomeDir(f.sessionDB)
 	if err != nil {
 		return err
 	}

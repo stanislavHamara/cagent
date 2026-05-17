@@ -2,12 +2,11 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 
-	"github.com/goccy/go-yaml"
-
-	"github.com/docker/cagent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/config/types"
 )
 
 const Version = "2"
@@ -319,9 +318,9 @@ func (s *RAGStrategyConfig) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling to flatten Params into parent level
-func (s RAGStrategyConfig) MarshalYAML() ([]byte, error) {
+func (s RAGStrategyConfig) MarshalYAML() (any, error) {
 	result := s.buildFlattenedMap()
-	return yaml.Marshal(result)
+	return result, nil
 }
 
 // MarshalJSON implements custom marshaling to flatten Params into parent level
@@ -461,7 +460,7 @@ func coerceToInt(v any) int {
 	case int64:
 		return int(val)
 	case uint64:
-		return int(val)
+		return int(val) //nolint:gosec // frozen config: value comes from validated YAML; bounds enforced by schema
 	case float64:
 		return int(val)
 	default:
@@ -484,7 +483,7 @@ func (d *RAGDatabaseConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		return nil
 	}
 
-	return fmt.Errorf("database must be a string path to a sqlite database")
+	return errors.New("database must be a string path to a sqlite database")
 }
 
 // AsString returns the database config as a connection string
@@ -499,7 +498,7 @@ func (d *RAGDatabaseConfig) AsString() (string, error) {
 		return str, nil
 	}
 
-	return "", fmt.Errorf("invalid database configuration: expected string path")
+	return "", errors.New("invalid database configuration: expected string path")
 }
 
 // IsEmpty returns true if no database is configured
@@ -508,11 +507,11 @@ func (d *RAGDatabaseConfig) IsEmpty() bool {
 }
 
 // MarshalYAML implements custom marshaling for DatabaseConfig
-func (d RAGDatabaseConfig) MarshalYAML() ([]byte, error) {
+func (d RAGDatabaseConfig) MarshalYAML() (any, error) {
 	if d.value == nil {
-		return yaml.Marshal(nil)
+		return nil, nil
 	}
-	return yaml.Marshal(d.value)
+	return d.value, nil
 }
 
 // MarshalJSON implements custom marshaling for DatabaseConfig
@@ -530,7 +529,7 @@ func (d *RAGDatabaseConfig) UnmarshalJSON(data []byte) error {
 		d.value = str
 		return nil
 	}
-	return fmt.Errorf("database must be a string path to a sqlite database")
+	return errors.New("database must be a string path to a sqlite database")
 }
 
 // RAGChunkingConfig represents text chunking configuration

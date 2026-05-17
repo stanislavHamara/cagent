@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/docker-agent/pkg/session"
 )
 
 func TestApp_NewSession_PreservesWorkingDir(t *testing.T) {
@@ -36,7 +36,6 @@ func TestApp_NewSession_PreservesAllSessionFlags(t *testing.T) {
 	rt := &mockRuntime{}
 
 	initialSess := session.New(
-		session.WithThinking(true),
 		session.WithToolsApproved(true),
 		session.WithHideToolResults(true),
 		session.WithWorkingDir("/work"),
@@ -46,7 +45,6 @@ func TestApp_NewSession_PreservesAllSessionFlags(t *testing.T) {
 	app.NewSession()
 
 	s := app.Session()
-	assert.True(t, s.Thinking)
 	assert.True(t, s.ToolsApproved)
 	assert.True(t, s.HideToolResults)
 	assert.Equal(t, "/work", s.WorkingDir)

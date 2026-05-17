@@ -2,12 +2,11 @@ package v3
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 
-	"github.com/goccy/go-yaml"
-
-	"github.com/docker/cagent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/config/types"
 )
 
 const Version = "3"
@@ -260,15 +259,15 @@ func (d *DeferConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	return nil
 }
 
-func (d DeferConfig) MarshalYAML() ([]byte, error) {
+func (d DeferConfig) MarshalYAML() (any, error) {
 	if d.DeferAll {
-		return yaml.Marshal(true)
+		return true, nil
 	}
 	if len(d.Tools) == 0 {
 		// Return false for empty config - this will be omitted by yaml encoder
-		return yaml.Marshal(false)
+		return false, nil
 	}
-	return yaml.Marshal(d.Tools)
+	return d.Tools, nil
 }
 
 // ThinkingBudget represents reasoning budget configuration.
@@ -301,14 +300,14 @@ func (t *ThinkingBudget) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling to output simple string or int format
-func (t ThinkingBudget) MarshalYAML() ([]byte, error) {
+func (t ThinkingBudget) MarshalYAML() (any, error) {
 	// If Effort string is set (non-empty), marshal as string
 	if t.Effort != "" {
-		return yaml.Marshal(t.Effort)
+		return t.Effort, nil
 	}
 
 	// Otherwise marshal as integer (includes 0, -1, and positive values)
-	return yaml.Marshal(t.Tokens)
+	return t.Tokens, nil
 }
 
 // MarshalJSON implements custom marshaling to output simple string or int format
@@ -449,9 +448,9 @@ func (s *RAGStrategyConfig) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling to flatten Params into parent level
-func (s RAGStrategyConfig) MarshalYAML() ([]byte, error) {
+func (s RAGStrategyConfig) MarshalYAML() (any, error) {
 	result := s.buildFlattenedMap()
-	return yaml.Marshal(result)
+	return result, nil
 }
 
 // MarshalJSON implements custom marshaling to flatten Params into parent level
@@ -598,7 +597,7 @@ func coerceToInt(v any) int {
 	case int64:
 		return int(val)
 	case uint64:
-		return int(val)
+		return int(val) //nolint:gosec // frozen config: value comes from validated YAML; bounds enforced by schema
 	case float64:
 		return int(val)
 	default:
@@ -621,7 +620,7 @@ func (d *RAGDatabaseConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		return nil
 	}
 
-	return fmt.Errorf("database must be a string path to a sqlite database")
+	return errors.New("database must be a string path to a sqlite database")
 }
 
 // AsString returns the database config as a connection string
@@ -636,7 +635,7 @@ func (d *RAGDatabaseConfig) AsString() (string, error) {
 		return str, nil
 	}
 
-	return "", fmt.Errorf("invalid database configuration: expected string path")
+	return "", errors.New("invalid database configuration: expected string path")
 }
 
 // IsEmpty returns true if no database is configured

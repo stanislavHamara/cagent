@@ -7,11 +7,11 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/tools"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 // ConfirmKeyMap defines key bindings for confirmation dialogs (Yes/No).
@@ -120,6 +120,15 @@ func RenderSeparator(contentWidth int) string {
 		Align(lipgloss.Center).
 		Width(contentWidth).
 		Render(strings.Repeat("─", separatorWidth))
+}
+
+// RenderGroupSeparator renders a labelled section separator inside a list,
+// like "── Custom themes ──────────────". It is used to visually divide
+// groups of items in a picker list.
+func RenderGroupSeparator(label string, contentWidth int) string {
+	prefix := "── " + strings.TrimSpace(label) + " "
+	dashes := max(0, contentWidth-lipgloss.Width(prefix)-2)
+	return styles.MutedStyle.Render(prefix + strings.Repeat("─", dashes))
 }
 
 // RenderHelp renders help text at the bottom of a dialog in italic muted style.

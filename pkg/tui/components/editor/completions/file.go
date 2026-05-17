@@ -2,11 +2,11 @@ package completions
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"sync"
 
-	"github.com/docker/cagent/pkg/fsx"
-	"github.com/docker/cagent/pkg/tui/components/completion"
+	"github.com/docker/docker-agent/pkg/fsx"
+	"github.com/docker/docker-agent/pkg/tui/components/completion"
 )
 
 // Initial loading limits for snappy UX
@@ -65,7 +65,7 @@ func (c *fileCompletion) Items() []completion.Item {
 	}
 
 	// Sort files by name
-	sort.Strings(files)
+	slices.Sort(files)
 
 	items := make([]completion.Item, len(files))
 	for i, f := range files {
@@ -125,7 +125,7 @@ func (c *fileCompletion) LoadInitialItemsAsync(ctx context.Context) <-chan []com
 		}
 
 		// Sort files by name
-		sort.Strings(files)
+		slices.Sort(files)
 
 		items := make([]completion.Item, len(files))
 		for i, f := range files {
@@ -189,7 +189,7 @@ func (c *fileCompletion) LoadItemsAsync(ctx context.Context) <-chan []completion
 		}
 
 		// Sort files by name
-		sort.Strings(files)
+		slices.Sort(files)
 
 		items := make([]completion.Item, len(files))
 		for i, f := range files {

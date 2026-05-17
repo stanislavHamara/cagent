@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/docker/docker-agent/pkg/remote"
 )
 
 const (
@@ -22,27 +25,57 @@ const (
 
 // Store manages access to the models.dev data.
 // All methods are safe for concurrent use.
+//
+// The database is loaded on first access via GetDatabase and
+// then cached in memory for the lifetime of the Store.
 type Store struct {
 	cacheFile string
 	mu        sync.Mutex
 	db        *Database
 }
 
-// NewStore creates a new models.dev store.
-// The database is loaded on first access via GetDatabase.
-func NewStore() (*Store, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user home directory: %w", err)
+// Opt configures a Store created with NewStore.
+type Opt func(*storeOptions)
+
+type storeOptions struct {
+	cacheFile string
+}
+
+// WithCache overrides the path of the on-disk cache file used by the Store.
+// The parent directory will be created if it does not already exist.
+func WithCache(path string) Opt {
+	return func(o *storeOptions) {
+		o.cacheFile = path
+	}
+}
+
+// NewStore creates a new Store backed by an on-disk cache. By default the
+// cache lives at ~/.cagent/models_dev.json; use WithCache to override the
+// location.
+// Callers should create one Store and share it rather than calling NewStore
+// repeatedly. RuntimeConfig.ModelsDevStore() is the standard way to obtain
+// a shared instance.
+func NewStore(opts ...Opt) (*Store, error) {
+	var options storeOptions
+	for _, opt := range opts {
+		opt(&options)
 	}
 
-	cacheDir := filepath.Join(homeDir, ".cagent")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+	cacheFile := options.cacheFile
+	if cacheFile == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get user home directory: %w", err)
+		}
+		cacheFile = filepath.Join(homeDir, ".cagent", CacheFileName)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	return &Store{
-		cacheFile: filepath.Join(cacheDir, CacheFileName),
+		cacheFile: cacheFile,
 	}, nil
 }
 
@@ -72,8 +105,8 @@ func (s *Store) GetDatabase(ctx context.Context) (*Database, error) {
 	return db, nil
 }
 
-// GetProvider returns a specific provider by ID.
-func (s *Store) GetProvider(ctx context.Context, providerID string) (*Provider, error) {
+// getProvider returns a specific provider by ID.
+func (s *Store) getProvider(ctx context.Context, providerID string) (*Provider, error) {
 	db, err := s.GetDatabase(ctx)
 	if err != nil {
 		return nil, err
@@ -87,40 +120,32 @@ func (s *Store) GetProvider(ctx context.Context, providerID string) (*Provider, 
 	return &provider, nil
 }
 
-// GetModel returns a specific model by provider ID and model ID.
-func (s *Store) GetModel(ctx context.Context, id string) (*Model, error) {
-	parts := strings.SplitN(id, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid model ID: %q", id)
+// GetModel returns a specific model by ID. The ID must carry both a
+// provider and a model component; pass the result of [NewID], [ParseID],
+// or a provider's [ID] method.
+func (s *Store) GetModel(ctx context.Context, id ID) (*Model, error) {
+	if !id.IsValid() {
+		return nil, fmt.Errorf("invalid model ID: %q", id.String())
 	}
-	providerID := parts[0]
-	modelID := parts[1]
 
-	provider, err := s.GetProvider(ctx, providerID)
+	provider, err := s.getProvider(ctx, id.Provider)
 	if err != nil {
 		return nil, err
 	}
 
-	model, exists := provider.Models[modelID]
-	if !exists {
-		// For amazon-bedrock, try stripping region/inference profile prefixes
-		// Bedrock uses prefixes for cross-region inference profiles,
-		// but models.dev stores models without these prefixes.
-		//
-		// Strip known region prefixes and retry lookup.
-		if providerID == "amazon-bedrock" {
-			if before, after, ok := strings.Cut(modelID, "."); ok {
-				possibleRegionPrefix := before
-				if isBedrockRegionPrefix(possibleRegionPrefix) {
-					normalizedModelID := after
-					model, exists = provider.Models[normalizedModelID]
-					if exists {
-						return &model, nil
-					}
-				}
-			}
+	model, exists := provider.Models[id.Model]
+
+	// For amazon-bedrock, try stripping region/inference profile prefixes.
+	// Bedrock uses prefixes for cross-region inference profiles,
+	// but models.dev stores models without these prefixes.
+	if !exists && id.Provider == "amazon-bedrock" {
+		if prefix, after, ok := strings.Cut(id.Model, "."); ok && bedrockRegionPrefixes[prefix] {
+			model, exists = provider.Models[after]
 		}
-		return nil, fmt.Errorf("model %q not found in provider %q", modelID, providerID)
+	}
+
+	if !exists {
+		return nil, fmt.Errorf("model %q not found in provider %q", id.Model, id.Provider)
 	}
 
 	return &model, nil
@@ -135,73 +160,106 @@ func loadDatabase(ctx context.Context, cacheFile string) (*Database, error) {
 		return &cached.Database, nil
 	}
 
-	// Cache is invalid or doesn't exist, fetch from API
-	database, fetchErr := fetchFromAPI(ctx)
+	// Cache is stale or doesn't exist — try a conditional fetch with the ETag.
+	var etag string
+	if cached != nil {
+		etag = cached.ETag
+	}
+
+	database, newETag, fetchErr := fetchFromAPI(ctx, etag)
 	if fetchErr != nil {
-		// If API fetch fails, but we have cached data, use it
+		// If API fetch fails but we have cached data, use it regardless of age.
 		if cached != nil {
+			slog.DebugContext(ctx, "API fetch failed, using stale cache", "error", fetchErr)
 			return &cached.Database, nil
 		}
 		return nil, fmt.Errorf("failed to fetch from API and no cached data available: %w", fetchErr)
 	}
 
-	// Save to cache
-	if err := saveToCache(cacheFile, database); err != nil {
-		// Log the error but don't fail the request
-		slog.Warn("Warning: failed to save to cache", "error", err)
+	// database is nil when the server returned 304 Not Modified.
+	if database == nil && cached != nil {
+		// Bump LastRefresh so we don't re-check until the next interval.
+		cached.LastRefresh = time.Now()
+		if saveErr := saveToCache(cacheFile, &cached.Database, cached.ETag); saveErr != nil {
+			slog.WarnContext(ctx, "Failed to update cache timestamp", "error", saveErr)
+		}
+		return &cached.Database, nil
+	}
+
+	// Save the fresh data to cache.
+	if saveErr := saveToCache(cacheFile, database, newETag); saveErr != nil {
+		slog.WarnContext(ctx, "Failed to save to cache", "error", saveErr)
 	}
 
 	return database, nil
 }
 
-func fetchFromAPI(ctx context.Context) (*Database, error) {
+// fetchFromAPI fetches the models.dev database.
+// If etag is non-empty it is sent as If-None-Match; a 304 response
+// returns (nil, etag, nil) to indicate no change.
+func fetchFromAPI(ctx context.Context, etag string) (*Database, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ModelsDevAPIURL, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second, Transport: remote.NewTransport(ctx)}).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch from API: %w", err)
+		return nil, "", fmt.Errorf("failed to fetch from API: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotModified {
+		slog.DebugContext(ctx, "models.dev data not modified (304)")
+		return nil, etag, nil
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	// Read the full body then unmarshal — avoids the extra intermediate
+	// buffering that json.Decoder.Decode performs.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var providers map[string]Provider
-	if err := json.NewDecoder(resp.Body).Decode(&providers); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal(body, &providers); err != nil {
+		return nil, "", fmt.Errorf("failed to decode response: %w", err)
 	}
+
+	newETag := resp.Header.Get("ETag")
 
 	return &Database{
 		Providers: providers,
-		UpdatedAt: time.Now(),
-	}, nil
+	}, newETag, nil
 }
 
 func loadFromCache(cacheFile string) (*CachedData, error) {
-	f, err := os.Open(cacheFile)
+	data, err := os.ReadFile(cacheFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open cache file: %w", err)
+		return nil, fmt.Errorf("failed to read cache file: %w", err)
 	}
-	defer f.Close()
 
 	var cached CachedData
-	if err := json.NewDecoder(f).Decode(&cached); err != nil {
+	if err := json.Unmarshal(data, &cached); err != nil {
 		return nil, fmt.Errorf("failed to decode cached data: %w", err)
 	}
 
 	return &cached, nil
 }
 
-func saveToCache(cacheFile string, database *Database) error {
-	now := time.Now()
+func saveToCache(cacheFile string, database *Database, etag string) error {
 	cached := CachedData{
 		Database:    *database,
-		CachedAt:    now,
-		LastRefresh: now,
+		LastRefresh: time.Now(),
+		ETag:        etag,
 	}
 
 	data, err := json.MarshalIndent(cached, "", "  ")
@@ -209,7 +267,7 @@ func saveToCache(cacheFile string, database *Database) error {
 		return fmt.Errorf("failed to marshal cached data: %w", err)
 	}
 
-	if err := os.WriteFile(cacheFile, data, 0o644); err != nil {
+	if err := os.WriteFile(cacheFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
 	}
 
@@ -233,8 +291,7 @@ func (s *Store) ResolveModelAlias(ctx context.Context, providerID, modelName str
 		return modelName
 	}
 
-	// Get the provider from the database
-	provider, err := s.GetProvider(ctx, providerID)
+	provider, err := s.getProvider(ctx, providerID)
 	if err != nil {
 		return modelName
 	}
@@ -266,46 +323,8 @@ func (s *Store) ResolveModelAlias(ctx context.Context, providerID, modelName str
 // stores models without regional prefixes. AWS uses these for cross-region inference profiles.
 // See: https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html
 var bedrockRegionPrefixes = map[string]bool{
-	"us":     true, // US region inference profile
-	"eu":     true, // EU region inference profile
-	"apac":   true, // Asia Pacific region inference profile
-	"global": true, // Global inference profile (routes to any available region)
-}
-
-// isBedrockRegionPrefix returns true if the prefix is a known Bedrock regional/inference profile prefix.
-func isBedrockRegionPrefix(prefix string) bool {
-	return bedrockRegionPrefixes[prefix]
-}
-
-// ModelSupportsReasoning checks if the given model ID supports reasoning/thinking.
-//
-// This function implements fail-open semantics:
-//   - If modelID is empty or not in "provider/model" format, returns true (fail-open)
-//   - If models.dev lookup fails for any reason, returns true (fail-open)
-//   - If lookup succeeds, returns the model's Reasoning field value
-func ModelSupportsReasoning(ctx context.Context, modelID string) bool {
-	// Fail-open for empty model ID
-	if modelID == "" {
-		return true
-	}
-
-	// Fail-open if not in provider/model format
-	if !strings.Contains(modelID, "/") {
-		slog.Debug("Model ID not in provider/model format, assuming reasoning supported to allow user choice", "model_id", modelID)
-		return true
-	}
-
-	store, err := NewStore()
-	if err != nil {
-		slog.Debug("Failed to create modelsdev store, assuming reasoning supported to allow user choice", "error", err)
-		return true
-	}
-
-	model, err := store.GetModel(ctx, modelID)
-	if err != nil {
-		slog.Debug("Failed to lookup model in models.dev, assuming reasoning supported to allow user choice", "model_id", modelID, "error", err)
-		return true
-	}
-
-	return model.Reasoning
+	"us":     true,
+	"eu":     true,
+	"apac":   true,
+	"global": true,
 }

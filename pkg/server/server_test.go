@@ -15,9 +15,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/api"
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/docker-agent/pkg/api"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/session"
 )
 
 func TestServer_ListAgents(t *testing.T) {
@@ -95,7 +95,7 @@ func startServer(t *testing.T, ctx context.Context, agentsDir string) string {
 
 	sources, err := config.ResolveSources(agentsDir, nil)
 	require.NoError(t, err)
-	srv, err := New(ctx, store, &runConfig, 0, sources)
+	srv, err := New(ctx, store, &runConfig, 0, sources, "")
 	require.NoError(t, err)
 
 	socketPath := "unix://" + filepath.Join(t.TempDir(), "sock")
@@ -206,7 +206,7 @@ func startServerWithStore(t *testing.T, ctx context.Context, agentsDir string, s
 
 	sources, err := config.ResolveSources(agentsDir, nil)
 	require.NoError(t, err)
-	srv, err := New(ctx, store, &runConfig, 0, sources)
+	srv, err := New(ctx, store, &runConfig, 0, sources, "")
 	require.NoError(t, err)
 
 	socketPath := "unix://" + filepath.Join(t.TempDir(), "sock")

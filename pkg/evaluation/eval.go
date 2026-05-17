@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,40 +19,44 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/model/provider"
-	"github.com/docker/cagent/pkg/model/provider/options"
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/session"
 )
 
 // Runner runs evaluations against an agent.
 type Runner struct {
 	Config
+
 	agentSource config.Source
 	judge       *Judge
 	runConfig   *config.RuntimeConfig
 
-	// imageCache caches built Docker images by working directory.
-	// Key is the working directory (empty string for no working dir).
-	imageCache   map[string]string
+	// imageCache caches built Docker images by (workingDir, image) pair.
+	imageCache   map[imageKey]string
 	imageCacheMu sync.Mutex
+
+	// imageBuildGroup deduplicates concurrent image builds for the same (workingDir, image) pair.
+	imageBuildGroup singleflight.Group
 }
 
 // newRunner creates a new evaluation runner.
 func newRunner(agentSource config.Source, runConfig *config.RuntimeConfig, judgeModel provider.Provider, cfg Config) *Runner {
 	var judge *Judge
 	if judgeModel != nil {
-		judge = NewJudge(judgeModel, runConfig, cfg.Concurrency)
+		judge = NewJudge(judgeModel, cfg.Concurrency)
 	}
 	return &Runner{
 		Config:      cfg,
 		agentSource: agentSource,
 		judge:       judge,
 		runConfig:   runConfig,
-		imageCache:  make(map[string]string),
+		imageCache:  make(map[imageKey]string),
 	}
 }
 
@@ -85,6 +90,7 @@ func Evaluate(ctx context.Context, ttyOut, out io.Writer, isTTY bool, runName st
 		Name:      runName,
 		Timestamp: startTime,
 		Duration:  duration,
+		Config:    cfg,
 		Results:   results,
 		Summary:   summary,
 	}
@@ -110,6 +116,20 @@ func (r *Runner) Run(ctx context.Context, ttyOut, out io.Writer, isTTY bool) ([]
 	evals, err := r.loadEvalSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading evaluations: %w", err)
+	}
+
+	// Check whether any evaluations require relevance checking.
+	// If so, the judge must be configured and working; validate eagerly
+	// to fail fast on configuration issues (bad API key, wrong model, etc.)
+	// instead of silently producing zero-relevance results.
+	if needsJudge(evals) {
+		if r.judge == nil {
+			return nil, errors.New("some evaluations have relevance criteria but no judge model is configured (use --judge-model)")
+		}
+		fmt.Fprintln(out, "Validating judge model...")
+		if err := r.judge.Validate(ctx); err != nil {
+			return nil, fmt.Errorf("%w", err)
+		}
 	}
 
 	// Pre-build all unique Docker images in parallel before running evaluations.
@@ -140,11 +160,11 @@ func (r *Runner) Run(ctx context.Context, ttyOut, out io.Writer, isTTY bool) ([]
 					return
 				}
 
-				progress.setRunning(item.eval.Title)
+				progress.setRunning(item.eval.displayTitle())
 				result, runErr := r.runSingleEval(ctx, item.eval)
 				if runErr != nil {
 					result.Error = runErr.Error()
-					slog.Error("Evaluation failed", "title", item.eval.Title, "error", runErr)
+					slog.ErrorContext(ctx, "Evaluation failed", "title", item.eval.displayTitle(), "error", runErr)
 				}
 
 				results[item.index] = result
@@ -207,67 +227,88 @@ func (r *Runner) loadEvalSessions(ctx context.Context) ([]InputSession, error) {
 		return cmp.Compare(b.Duration(), a.Duration())
 	})
 
+	// Repeat evals if requested
+	repeat := max(r.Repeat, 1)
+	if repeat > 1 {
+		original := evals
+		evals = make([]InputSession, 0, len(original)*repeat)
+		for i := range repeat {
+			for _, e := range original {
+				evals = append(evals, InputSession{
+					Session:     e.Session,
+					SourcePath:  e.SourcePath,
+					RepeatIndex: i + 1,
+				})
+			}
+		}
+	}
+
 	return evals, nil
 }
 
 // preBuildImages pre-builds all unique Docker images needed for the evaluations.
-// This is done in parallel to avoid serialized builds during evaluation.
+// Concurrent calls for the same (workingDir, image) pair are deduplicated by
+// getOrBuildImage's singleflight, so we simply iterate over all evals.
 func (r *Runner) preBuildImages(ctx context.Context, out io.Writer, evals []InputSession) error {
-	// Collect unique working directories
-	workingDirs := make(map[string]struct{})
-	for _, eval := range evals {
-		if eval.Evals != nil {
-			workingDirs[eval.Evals.WorkingDir] = struct{}{}
-		}
-	}
-
-	if len(workingDirs) == 0 {
+	if len(evals) == 0 {
 		return nil
 	}
 
-	fmt.Fprintf(out, "Pre-building %d Docker image(s)...\n", len(workingDirs))
-
-	// Build images in parallel with limited concurrency
-	type buildResult struct {
-		workingDir string
-		err        error
+	// Count unique images to report an accurate number.
+	unique := make(map[imageKey]struct{})
+	for _, eval := range evals {
+		var key imageKey
+		if eval.Evals != nil {
+			key = imageKey{workingDir: eval.Evals.WorkingDir, image: eval.Evals.Image}
+		}
+		unique[key] = struct{}{}
 	}
 
-	work := make(chan string, len(workingDirs))
-	for wd := range workingDirs {
-		work <- wd
+	fmt.Fprintf(out, "Pre-building %d Docker image(s)...\n", len(unique))
+
+	type buildResult struct {
+		title string
+		err   error
+	}
+
+	work := make(chan InputSession, len(evals))
+	for _, eval := range evals {
+		work <- eval
 	}
 	close(work)
 
-	results := make(chan buildResult, len(workingDirs))
+	results := make(chan buildResult, len(evals))
 
-	// Use same concurrency as evaluation runs for image builds
-	buildWorkers := min(r.Concurrency, len(workingDirs))
+	buildWorkers := min(r.Concurrency, len(evals))
 	var wg sync.WaitGroup
 	for range buildWorkers {
 		wg.Go(func() {
-			for wd := range work {
+			for eval := range work {
 				if ctx.Err() != nil {
-					results <- buildResult{workingDir: wd, err: ctx.Err()}
+					results <- buildResult{title: eval.Title, err: ctx.Err()}
 					continue
 				}
-				_, err := r.getOrBuildImage(ctx, wd)
-				results <- buildResult{workingDir: wd, err: err}
+
+				criteria := eval.Evals
+				if criteria == nil {
+					criteria = &session.EvalCriteria{}
+				}
+
+				_, err := r.getOrBuildImage(ctx, criteria)
+				results <- buildResult{title: eval.Title, err: err}
 			}
 		})
 	}
 
-	// Wait for all builds to complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect errors
 	var errs []error
 	for result := range results {
 		if result.err != nil {
-			errs = append(errs, fmt.Errorf("building image for %q: %w", result.workingDir, result.err))
+			errs = append(errs, fmt.Errorf("building image for %q: %w", result.title, result.err))
 		}
 	}
 
@@ -280,7 +321,9 @@ func (r *Runner) preBuildImages(ctx context.Context, out io.Writer, evals []Inpu
 
 func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Result, error) {
 	startTime := time.Now()
-	slog.Debug("Starting evaluation", "title", evalSess.Title)
+	title := evalSess.displayTitle()
+
+	slog.DebugContext(ctx, "Starting evaluation", "title", title)
 
 	var evals *session.EvalCriteria
 	if evalSess.Evals != nil {
@@ -289,10 +332,12 @@ func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Res
 		evals = &session.EvalCriteria{}
 	}
 
+	userMessages := getUserMessages(evalSess.Session)
+
 	result := Result{
 		InputPath:         evalSess.SourcePath,
-		Title:             evalSess.Title,
-		Question:          strings.Join(getUserMessages(evalSess.Session), "\n"),
+		Title:             title,
+		Question:          strings.Join(userMessages, "\n"),
 		SizeExpected:      evals.Size,
 		RelevanceExpected: float64(len(evals.Relevance)),
 	}
@@ -302,16 +347,14 @@ func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Res
 		result.ToolCallsExpected = 1.0
 	}
 
-	workingDir := evals.WorkingDir
-
-	imageID, err := r.getOrBuildImage(ctx, workingDir)
+	imageID, err := r.getOrBuildImage(ctx, evals)
 	if err != nil {
 		return result, fmt.Errorf("building eval image: %w", err)
 	}
 
-	events, err := r.runCagentInContainer(ctx, imageID, getUserMessages(evalSess.Session), evals.Setup)
+	events, err := r.runDockerAgentInContainer(ctx, imageID, userMessages, evals.Setup)
 	if err != nil {
-		return result, fmt.Errorf("running cagent in container: %w", err)
+		return result, fmt.Errorf("running docker agent in container: %w", err)
 	}
 
 	response, cost, outputTokens, actualToolCalls := parseContainerEvents(events)
@@ -322,34 +365,42 @@ func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Res
 	result.Size = getResponseSize(result.Response)
 
 	// Build session from events for database storage
-	result.Session = SessionFromEvents(events, evalSess.Title, getUserMessages(evalSess.Session))
+	result.Session = SessionFromEvents(events, title, userMessages)
 	result.Session.Evals = evals
+
+	// Re-apply the display title in case a session_title event overrode it.
+	// This ensures repeated evals retain their '#N' suffix in stored sessions.
+	result.Session.Title = title
 
 	if len(expectedToolCalls) > 0 || len(actualToolCalls) > 0 {
 		result.ToolCallsScore = toolCallF1Score(expectedToolCalls, actualToolCalls)
 	}
 
-	result.HandoffsMatch = countHandoffs(expectedToolCalls) == countHandoffs(actualToolCalls)
-
 	if r.judge != nil && len(evals.Relevance) > 0 {
 		// Use transcript for relevance checking to preserve temporal ordering
 		transcript := buildTranscript(events)
-		passed, failed, errs := r.judge.CheckRelevance(ctx, transcript, evals.Relevance)
-		result.RelevancePassed = float64(passed)
-		result.FailedRelevance = failed
-		for _, e := range errs {
-			slog.Warn("Relevance check error", "title", evalSess.Title, "error", e)
+		results, err := r.judge.CheckRelevance(ctx, transcript, evals.Relevance)
+		if err != nil {
+			return result, fmt.Errorf("relevance check failed: %w", err)
 		}
+		var passed float64
+		for _, rr := range results {
+			if rr.Passed {
+				passed++
+			}
+		}
+		result.RelevancePassed = passed
+		result.RelevanceResults = results
 	}
 
-	slog.Debug("Evaluation complete", "title", evalSess.Title, "duration", time.Since(startTime))
+	slog.DebugContext(ctx, "Evaluation complete", "title", title, "duration", time.Since(startTime))
 	return result, nil
 }
 
-func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, questions []string, setup string) ([]map[string]any, error) {
+func (r *Runner) runDockerAgentInContainer(ctx context.Context, imageID string, questions []string, setup string) ([]map[string]any, error) {
 	agentDir := r.agentSource.ParentDir()
 	agentFile := filepath.Base(r.agentSource.Name())
-	containerName := fmt.Sprintf("cagent-eval-%d", uuid.New().ID())
+	containerName := fmt.Sprintf("docker-agent-eval-%d", uuid.New().ID())
 
 	args := []string{
 		"run",
@@ -367,20 +418,20 @@ func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, quest
 
 	var env []string
 
-	for _, name := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "NEBIUS_API_KEY"} {
-		if val, ok := r.runConfig.EnvProvider().Get(ctx, name); ok && val != "" {
-			args = append(args, "-e", name)
-			env = append(env, name+"="+val)
-		}
-	}
-
 	if r.runConfig.ModelsGateway != "" {
-		args = append(args, "-e", "CAGENT_MODELS_GATEWAY")
-		env = append(env, "CAGENT_MODELS_GATEWAY="+r.runConfig.ModelsGateway)
+		args = append(args, "-e", "DOCKER_AGENT_MODELS_GATEWAY")
+		env = append(env, "DOCKER_AGENT_MODELS_GATEWAY="+r.runConfig.ModelsGateway)
 
 		if token, ok := r.runConfig.EnvProvider().Get(ctx, environment.DockerDesktopTokenEnv); ok && token != "" {
 			args = append(args, "-e", environment.DockerDesktopTokenEnv)
 			env = append(env, environment.DockerDesktopTokenEnv+"="+token)
+		}
+	} else {
+		for _, name := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "NEBIUS_API_KEY"} {
+			if val, ok := r.runConfig.EnvProvider().Get(ctx, name); ok && val != "" {
+				args = append(args, "-e", name)
+				env = append(env, name+"="+val)
+			}
 		}
 	}
 
@@ -397,11 +448,11 @@ func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, quest
 	}
 
 	// When a setup script is provided, mount it into the container and
-	// override the entrypoint to run it before cagent run --exec.
-	// The default entrypoint is: /run.sh /cagent run --exec --yolo --json
+	// override the entrypoint to run it before docker agent run --exec.
+	// The default entrypoint is: /run.sh /docker-agent run --exec --yolo --json
 	// /run.sh starts dockerd then exec's "$@".
 	if setup != "" {
-		setupFile := filepath.Join(os.TempDir(), fmt.Sprintf("cagent-eval-setup-%d.sh", uuid.New().ID()))
+		setupFile := filepath.Join(os.TempDir(), fmt.Sprintf("docker-agent-eval-setup-%d.sh", uuid.New().ID()))
 		if err := os.WriteFile(setupFile, []byte(setup), 0o600); err != nil {
 			return nil, fmt.Errorf("writing setup script: %w", err)
 		}
@@ -416,8 +467,8 @@ func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, quest
 	args = append(args, imageID)
 
 	if setup != "" {
-		// Run setup script, then cagent run --exec with the original arguments.
-		args = append(args, "sh", "-c", "sh /setup.sh && exec /cagent run --exec --yolo --json \"$@\"", "--", "/configs/"+agentFile)
+		// Run setup script, then docker agent run --exec with the original arguments.
+		args = append(args, "sh", "-c", "sh /setup.sh && exec /docker-agent run --exec --yolo --json \"$@\"", "--", "/configs/"+agentFile)
 	} else {
 		args = append(args, "/configs/"+agentFile)
 	}
@@ -455,19 +506,19 @@ func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, quest
 
 		var event map[string]any
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			slog.Debug("Failed to parse JSON event", "line", line, "error", err)
+			slog.DebugContext(ctx, "Failed to parse JSON event", "line", line, "error", err)
 			continue
 		}
 		events = append(events, event)
 	}
 
 	if err := scanner.Err(); err != nil {
-		slog.Warn("Error reading container output", "error", err)
+		slog.WarnContext(ctx, "Error reading container output", "error", err)
 	}
 
 	waitErr := cmd.Wait()
 	if waitErr != nil {
-		slog.Debug("Container exited with error", "stderr", string(stderrData), "error", waitErr)
+		slog.DebugContext(ctx, "Container exited with error", "stderr", string(stderrData), "error", waitErr)
 	}
 
 	if len(events) == 0 {
@@ -478,7 +529,7 @@ func (r *Runner) runCagentInContainer(ctx context.Context, imageID string, quest
 		if stderrStr != "" {
 			return nil, fmt.Errorf("no events received from container (stderr: %s)", stderrStr)
 		}
-		return nil, fmt.Errorf("no events received from container")
+		return nil, errors.New("no events received from container")
 	}
 
 	return events, nil
@@ -553,7 +604,12 @@ func buildTranscript(events []map[string]any) string {
 			fmt.Fprintf(&transcript, "[Agent %s calls tool %q with arguments: %s]\n\n", cmp.Or(currentAgent, "unknown"), name, args)
 
 		case "tool_call_response":
-			name, _ := getToolCallInfo(event)
+			// The ToolCallResponseEvent has tool_definition at the top level, not
+			// nested under "tool_call".
+			var name string
+			if td, ok := event["tool_definition"].(map[string]any); ok {
+				name, _ = td["name"].(string)
+			}
 			response, _ := event["response"].(string)
 			if len(response) > 500 {
 				response = response[:500] + "...(truncated)"
@@ -583,6 +639,14 @@ func matchesAnyPattern(name string, patterns []string) bool {
 	})
 }
 
+// needsJudge returns true if any evaluation session has relevance criteria,
+// meaning a judge model is required to evaluate them.
+func needsJudge(evals []InputSession) bool {
+	return slices.ContainsFunc(evals, func(s InputSession) bool {
+		return s.Evals != nil && len(s.Evals.Relevance) > 0
+	})
+}
+
 // createJudgeModel creates a provider.Provider from a model string (format: provider/model).
 // Returns nil if judgeModel is empty.
 func createJudgeModel(ctx context.Context, judgeModel string, runConfig *config.RuntimeConfig) (provider.Provider, error) {
@@ -590,22 +654,19 @@ func createJudgeModel(ctx context.Context, judgeModel string, runConfig *config.
 		return nil, nil
 	}
 
-	providerName, model, ok := strings.Cut(judgeModel, "/")
-	if !ok {
+	cfg, err := latest.ParseModelRef(judgeModel)
+	if err != nil {
 		return nil, fmt.Errorf("invalid judge model format %q: expected 'provider/model'", judgeModel)
 	}
 
-	cfg := &latest.ModelConfig{
-		Provider: providerName,
-		Model:    model,
+	opts := []options.Opt{
+		options.WithStructuredOutput(judgeResponseSchema),
 	}
-
-	var opts []options.Opt
 	if runConfig.ModelsGateway != "" {
 		opts = append(opts, options.WithGateway(runConfig.ModelsGateway))
 	}
 
-	judge, err := provider.New(ctx, cfg, runConfig.EnvProvider(), opts...)
+	judge, err := provider.New(ctx, &cfg, runConfig.EnvProvider(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating judge model: %w", err)
 	}

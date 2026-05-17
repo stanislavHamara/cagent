@@ -1,12 +1,16 @@
-# 🤖 Docker `cagent` 🤖
+# 🤖 Docker Agent 🤖
 
 > Build, run, and share AI agents with a declarative YAML config, rich tool ecosystem, and multi-agent orchestration.
 
-![cagent in action](docs/demo.gif)
+![docker agent in action](docs/demo.gif)
 
-## What is Docker `cagent`?
+## What is Docker Agent?
 
-Docker `cagent` lets you create and run intelligent AI agents that collaborate to solve complex problems — no code required. Define agents in YAML, give them tools, and let them work.
+`docker-agent` lets you create and run intelligent AI agents that collaborate to solve complex problems — no code required.
+
+`docker-agent` is a `docker` CLI plugin and can be run with `docker agent`.
+
+Define agents in YAML, give them tools, and let them work.
 
 ```yaml
 agents:
@@ -22,7 +26,7 @@ agents:
 ```
 
 ```sh
-cagent run agent.yaml
+docker agent run agent.yaml
 ```
 
 ## Key Features
@@ -37,11 +41,11 @@ cagent run agent.yaml
 
 ## Install
 
-**Docker Desktop** (4.49+) — cagent is pre-installed. Just run `cagent`.
+**Docker Desktop** (4.63+) — docker-agent CLI plugin is pre-installed. Just run `docker agent`.
 
-**Homebrew** — `brew install cagent`
+**Homebrew** — `brew install docker-agent`. Run `docker-agent` directly or symlink the binary to `~/.docker/cli-plugins/docker-agent` and run `docker agent`.
 
-**Binary releases** — Download from [GitHub Releases](https://github.com/docker/cagent/releases).
+**Binary releases** — Download from [GitHub Releases](https://github.com/docker/docker-agent/releases). Symlink the `docker-agent` binary to `~/.docker/cli-plugins/docker-agent` to be able to use `docker agent`, or use `docker-agent` directly.
 
 Set at least one API key (or use [Docker Model Runner](https://docs.docker.com/ai/model-runner/) for local models):
 
@@ -53,42 +57,42 @@ export OPENAI_API_KEY=sk-...        # or ANTHROPIC_API_KEY, GOOGLE_API_KEY, etc.
 
 ```sh
 # Run the default agent
-cagent run
+docker agent run
 
 # Run from the agent catalog
-cagent run agentcatalog/pirate
+docker agent run agentcatalog/pirate
 
 # Generate a new agent interactively
-cagent new
+docker agent new
 
 # Run your own config
-cagent run agent.yaml
+docker agent run agent.yaml
 ```
 
 More examples in the [`examples/`](examples/README.md) directory.
 
 ## Documentation
 
-📖 **[Full documentation](https://docker.github.io/cagent/)**
+📖 **[Full documentation](https://docker.github.io/docker-agent/)**
 
-- [Installation](https://docker.github.io/cagent/#getting-started/installation) · [Quick Start](https://docker.github.io/cagent/#getting-started/quickstart)
-- [Agents](https://docker.github.io/cagent/#concepts/agents) · [Models](https://docker.github.io/cagent/#concepts/models) · [Tools](https://docker.github.io/cagent/#concepts/tools) · [Multi-Agent](https://docker.github.io/cagent/#concepts/multi-agent)
-- [Configuration Reference](https://docker.github.io/cagent/#configuration/overview)
-- [TUI](https://docker.github.io/cagent/#features/tui) · [CLI](https://docker.github.io/cagent/#features/cli) · [MCP Mode](https://docker.github.io/cagent/#features/mcp-mode) · [RAG](https://docker.github.io/cagent/#features/rag)
-- [Model Providers](https://docker.github.io/cagent/#providers/overview) · [Docker Model Runner](https://docker.github.io/cagent/#providers/dmr)
+- [Installation](https://docker.github.io/docker-agent/getting-started/installation) · [Quick Start](https://docker.github.io/docker-agent/getting-started/quickstart)
+- [Agents](https://docker.github.io/docker-agent/concepts/agents) · [Models](https://docker.github.io/docker-agent/concepts/models) · [Tools](https://docker.github.io/docker-agent/concepts/tools) · [Multi-Agent](https://docker.github.io/docker-agent/concepts/multi-agent)
+- [Configuration Reference](https://docker.github.io/docker-agent/configuration/overview)
+- [TUI](https://docker.github.io/docker-agent/features/tui) · [CLI](https://docker.github.io/docker-agent/features/cli) · [MCP Mode](https://docker.github.io/docker-agent/features/mcp-mode) · [RAG](https://docker.github.io/docker-agent/features/rag)
+- [Model Providers](https://docker.github.io/docker-agent/providers/overview) · [Docker Model Runner](https://docker.github.io/docker-agent/providers/dmr)
 
 ## Contributing
 
-Read the [Contributing guide](https://docker.github.io/cagent/#community/contributing) to get started. We use `cagent` to build `cagent`:
+Read the [Contributing guide](https://docker.github.io/docker-agent/community/contributing) to get started. We use `docker-agent` to build `docker-agent`:
 
 ```sh
-cagent run ./golang_developer.yaml
+docker agent run ./golang_developer.yaml
 ```
 
 ## Telemetry
 
-We collect anonymous usage data to improve the tool. See [Telemetry](https://docker.github.io/cagent/#community/telemetry).
+We collect anonymous usage data to improve the tool. See [Telemetry](https://docker.github.io/docker-agent/community/telemetry).
 
 ## Community
 
-[Docker Community Slack](http://dockr.ly/comm-slack) · [#cagent channel](https://dockercommunity.slack.com/archives/C09DASHHRU4)
+[Docker Community Slack](http://dockr.ly/comm-slack) · [#docker-agent channel](https://dockercommunity.slack.com/archives/C09DASHHRU4)

@@ -15,12 +15,18 @@ type TreeNode struct {
 	Children []*TreeNode `json:"children,omitempty"`
 }
 
-func DirectoryTree(path string, isPathAllowed func(string) error, shouldIgnore func(string) bool, maxItems int) (*TreeNode, error) {
+func DirectoryTree(ctx context.Context, path string, isPathAllowed func(string) error, shouldIgnore func(string) bool, maxItems int) (*TreeNode, error) {
 	itemCount := 0
-	return directoryTree(path, isPathAllowed, shouldIgnore, maxItems, &itemCount)
+	return directoryTree(ctx, path, isPathAllowed, shouldIgnore, maxItems, &itemCount)
 }
 
-func directoryTree(path string, isPathAllowed func(string) error, shouldIgnore func(string) bool, maxItems int, itemCount *int) (*TreeNode, error) {
+func directoryTree(ctx context.Context, path string, isPathAllowed func(string) error, shouldIgnore func(string) bool, maxItems int, itemCount *int) (*TreeNode, error) {
+	// Check for context cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if maxItems > 0 && *itemCount >= maxItems {
 		return nil, nil
 	}
@@ -47,6 +53,13 @@ func directoryTree(path string, isPathAllowed func(string) error, shouldIgnore f
 		}
 
 		for _, entry := range entries {
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				return node, ctx.Err()
+			default:
+			}
+
 			childPath := filepath.Join(path, entry.Name())
 			if err := isPathAllowed(childPath); err != nil {
 				continue // Skip disallowed paths
@@ -57,7 +70,7 @@ func directoryTree(path string, isPathAllowed func(string) error, shouldIgnore f
 				continue
 			}
 
-			childNode, err := directoryTree(childPath, isPathAllowed, shouldIgnore, maxItems, itemCount)
+			childNode, err := directoryTree(ctx, childPath, isPathAllowed, shouldIgnore, maxItems, itemCount)
 			if err != nil || childNode == nil {
 				continue
 			}
@@ -66,17 +79,6 @@ func directoryTree(path string, isPathAllowed func(string) error, shouldIgnore f
 	}
 
 	return node, nil
-}
-
-func ListDirectory(path string, shouldIgnore func(string) bool) ([]string, error) {
-	tree, err := DirectoryTree(path, func(string) error { return nil }, shouldIgnore, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	var files []string
-	CollectFilesFromTree(tree, "", &files)
-	return files, nil
 }
 
 // CollectFilesFromTree recursively collects file paths from a DirectoryTree.
@@ -125,6 +127,12 @@ var heavyDirs = map[string]bool{
 	".gradle":      true,
 	".idea":        true,
 	".vscode":      true,
+}
+
+// allowedDirs are hidden directories that should be traversed despite starting with a dot.
+var allowedDirs = map[string]bool{
+	".github": true,
+	".gitlab": true,
 }
 
 // WalkFiles walks the directory tree starting at root and returns a list of file paths.
@@ -176,12 +184,15 @@ func WalkFiles(ctx context.Context, root string, opts WalkFilesOptions) ([]strin
 
 		name := d.Name()
 
-		// Skip hidden files/directories (starting with .)
+		// Skip hidden files/directories (starting with .) except allowed dirs
 		if strings.HasPrefix(name, ".") && name != "." {
 			if d.IsDir() {
-				return fs.SkipDir
+				if !allowedDirs[name] {
+					return fs.SkipDir
+				}
+			} else {
+				return nil
 			}
-			return nil
 		}
 
 		// Skip known heavy directories

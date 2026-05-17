@@ -1,9 +1,11 @@
 package sqliteutil
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -23,7 +25,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	// _pragma=busy_timeout(5000): Wait up to 5 seconds if database is locked
 	// _pragma=journal_mode(WAL): Enable Write-Ahead Logging for better concurrent access
 	// _pragma=foreign_keys(1): Enable foreign key constraints (critical for ON DELETE CASCADE)
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -40,7 +42,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	db.SetConnMaxLifetime(0)
 
 	// Verify connection works (this will trigger file creation/open)
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		db.Close()
 		if IsCantOpenError(err) {
 			return nil, DiagnoseDBOpenError(path, err)
@@ -55,16 +57,6 @@ func OpenDB(path string) (*sql.DB, error) {
 func IsCantOpenError(err error) bool {
 	if sqliteErr, ok := errors.AsType[*sqlite.Error](err); ok {
 		return sqliteErr.Code() == sqlite3.SQLITE_CANTOPEN
-	}
-	return false
-}
-
-// IsNoSuchColumnError checks if the error is due to a missing column in SQLite.
-// This typically happens when querying a column that doesn't exist in the schema.
-func IsNoSuchColumnError(err error) bool {
-	if sqliteErr, ok := errors.AsType[*sqlite.Error](err); ok {
-		// SQLITE_ERROR (1) is the generic SQL error code used for "no such column"
-		return sqliteErr.Code() == sqlite3.SQLITE_ERROR
 	}
 	return false
 }
@@ -87,4 +79,15 @@ func DiagnoseDBOpenError(path string, originalErr error) error {
 	}
 
 	return fmt.Errorf("cannot create database at %q: permission denied or file cannot be created in %q (original error: %w)", path, dir, originalErr)
+}
+
+// CheckpointAndClose runs a final WAL checkpoint and closes the database.
+// The TRUNCATE checkpoint folds the -wal file back into the main database
+// so it isn't left behind on disk after shutdown. A checkpoint failure is
+// logged but does not prevent the close.
+func CheckpointAndClose(db *sql.DB) error {
+	if _, err := db.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		slog.Warn("Failed to checkpoint WAL before close", "error", err)
+	}
+	return db.Close()
 }

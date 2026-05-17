@@ -7,8 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/history"
+	"github.com/docker/docker-agent/pkg/history"
 )
 
 func enterSearch(t *testing.T, e *editor) *editor {
@@ -23,14 +22,14 @@ func TestHistorySearch(t *testing.T) {
 	setupEditor := func(t *testing.T, messages []string) *editor {
 		t.Helper()
 		tmpDir := t.TempDir()
-		h, err := history.New(history.WithBaseDir(tmpDir))
+		h, err := history.New(tmpDir)
 		require.NoError(t, err)
 
 		for _, msg := range messages {
 			require.NoError(t, h.Add(msg))
 		}
 
-		e := New(&app.App{}, h).(*editor)
+		e := New(h).(*editor)
 		e.textarea.SetWidth(80)
 		return e
 	}

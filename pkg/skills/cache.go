@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,11 +14,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/docker/docker-agent/pkg/remote"
 )
 
+// remoteHTTPTimeout caps each HTTP request made to a remote skills source.
+const remoteHTTPTimeout = 30 * time.Second
+
+// httpGet performs a GET request using the standard remote transport so that
+// Docker Desktop proxy/SSL settings are honoured. The returned response body
+// must be closed by the caller.
+func httpGet(ctx context.Context, url string) (*http.Response, error) {
+	client := &http.Client{
+		Timeout:   remoteHTTPTimeout,
+		Transport: remote.NewTransport(ctx),
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("creating request for %s: %w", url, err)
+	}
+	return client.Do(req)
+}
+
 type diskCache struct {
-	baseDir    string
-	httpClient *http.Client
+	baseDir string
 }
 
 type cacheMetadata struct {
@@ -29,9 +49,6 @@ type cacheMetadata struct {
 func newDiskCache(baseDir string) *diskCache {
 	return &diskCache{
 		baseDir: baseDir,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
 	}
 }
 
@@ -68,10 +85,10 @@ func (c *diskCache) Get(baseURL, skillName, filePath string) (string, bool) {
 
 // FetchAndStore downloads a file from the given URL and stores it in the cache.
 // It respects Cache-Control headers to determine expiry.
-func (c *diskCache) FetchAndStore(baseURL, skillName, filePath, fileURL string) (string, error) {
-	slog.Debug("Fetching remote skill file", "url", fileURL)
+func (c *diskCache) FetchAndStore(ctx context.Context, baseURL, skillName, filePath, fileURL string) (string, error) {
+	slog.DebugContext(ctx, "Fetching remote skill file", "url", fileURL)
 
-	resp, err := c.httpClient.Get(fileURL)
+	resp, err := httpGet(ctx, fileURL)
 	if err != nil {
 		return "", fmt.Errorf("fetching %s: %w", fileURL, err)
 	}
@@ -92,11 +109,11 @@ func (c *diskCache) FetchAndStore(baseURL, skillName, filePath, fileURL string) 
 	contentPath := filepath.Join(dir, filePath)
 	metaPath := contentPath + ".meta"
 
-	if err := os.MkdirAll(filepath.Dir(contentPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(contentPath), 0o700); err != nil {
 		return "", fmt.Errorf("creating cache directory: %w", err)
 	}
 
-	if err := os.WriteFile(contentPath, body, 0o644); err != nil {
+	if err := os.WriteFile(contentPath, body, 0o600); err != nil {
 		return "", fmt.Errorf("writing cache file: %w", err)
 	}
 
@@ -106,9 +123,9 @@ func (c *diskCache) FetchAndStore(baseURL, skillName, filePath, fileURL string) 
 		ExpiresAt: expiresAt,
 	}
 	metaJSON, _ := json.Marshal(meta)
-	if err := os.WriteFile(metaPath, metaJSON, 0o644); err != nil {
+	if err := os.WriteFile(metaPath, metaJSON, 0o600); err != nil {
 		// Non-fatal: the content is cached, just the metadata isn't
-		slog.Debug("Failed to write cache metadata", "path", metaPath, "error", err)
+		slog.DebugContext(ctx, "Failed to write cache metadata", "path", metaPath, "error", err)
 	}
 
 	return string(body), nil
@@ -135,7 +152,7 @@ func parseCacheExpiry(cacheControl string) time.Time {
 		return time.Now().Add(defaultCacheTTL)
 	}
 
-	for _, directive := range strings.Split(cacheControl, ",") {
+	for directive := range strings.SplitSeq(cacheControl, ",") {
 		directive = strings.TrimSpace(directive)
 
 		if strings.EqualFold(directive, "no-store") || strings.EqualFold(directive, "no-cache") {

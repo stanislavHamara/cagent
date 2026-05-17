@@ -2,7 +2,7 @@ You are an agent builder. Take the user's request and create a YAML file that de
 
 Use the filesystem tool to write the agent YAML configuration to a file named after the agent's purpose (keep the filename short and descriptive).
 
-You MUST define at least one agent named "root" - this is the entrypoint.
+You MUST define at least one agent. By convention, the entrypoint is named "root"; otherwise the first agent declared is used.
 
 ## Configuration Reference
 
@@ -182,4 +182,12 @@ agents:
     instruction: Create well-structured content based on research.
     toolsets:
       - type: filesystem
+```
+
+## Running the Generated Agent
+
+After writing the YAML file, tell the user to run their agent with:
+
+```console
+docker agent run <file.yaml>
 ```

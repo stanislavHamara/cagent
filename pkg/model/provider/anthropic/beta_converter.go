@@ -3,13 +3,14 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 // convertBetaMessages converts chat messages to Anthropic Beta API format
@@ -42,11 +43,11 @@ func (c *Client) convertBetaMessages(ctx context.Context, messages []chat.Messag
 						Content: contentBlocks,
 					})
 				}
-			} else if txt := strings.TrimSpace(msg.Content); txt != "" {
+			} else {
 				betaMessages = append(betaMessages, anthropic.BetaMessageParam{
 					Role: anthropic.BetaMessageParamRoleUser,
 					Content: []anthropic.BetaContentBlockParamUnion{
-						{OfText: &anthropic.BetaTextBlockParam{Text: txt}},
+						{OfText: &anthropic.BetaTextBlockParam{Text: msg.Content}},
 					},
 				})
 			}
@@ -67,9 +68,9 @@ func (c *Client) convertBetaMessages(ctx context.Context, messages []chat.Messag
 			}
 
 			// Add text content if present
-			if txt := strings.TrimSpace(msg.Content); txt != "" {
+			if msg.Content != "" {
 				contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
-					OfText: &anthropic.BetaTextBlockParam{Text: txt},
+					OfText: &anthropic.BetaTextBlockParam{Text: msg.Content},
 				})
 			}
 
@@ -103,27 +104,13 @@ func (c *Client) convertBetaMessages(ctx context.Context, messages []chat.Messag
 			// This is required by Anthropic API: all tool_result blocks for tool_use blocks
 			// from the same assistant message must be in the same user message
 			toolResultBlocks := []anthropic.BetaContentBlockParamUnion{
-				{
-					OfToolResult: &anthropic.BetaToolResultBlockParam{
-						ToolUseID: msg.ToolCallID,
-						Content: []anthropic.BetaToolResultBlockParamContentUnion{
-							{OfText: &anthropic.BetaTextBlockParam{Text: strings.TrimSpace(msg.Content)}},
-						},
-					},
-				},
+				convertBetaToolResultBlock(msg),
 			}
 
 			// Look ahead for consecutive tool messages and merge them
 			j := i + 1
 			for j < len(messages) && messages[j].Role == chat.MessageRoleTool {
-				toolResultBlocks = append(toolResultBlocks, anthropic.BetaContentBlockParamUnion{
-					OfToolResult: &anthropic.BetaToolResultBlockParam{
-						ToolUseID: messages[j].ToolCallID,
-						Content: []anthropic.BetaToolResultBlockParamContentUnion{
-							{OfText: &anthropic.BetaTextBlockParam{Text: strings.TrimSpace(messages[j].Content)}},
-						},
-					},
-				})
+				toolResultBlocks = append(toolResultBlocks, convertBetaToolResultBlock(&messages[j]))
 				j++
 			}
 
@@ -147,17 +134,74 @@ func (c *Client) convertBetaMessages(ctx context.Context, messages []chat.Messag
 
 // convertBetaUserMultiContent converts user message multi-content parts to Beta API content blocks.
 // It handles text, images (base64 and URL), and file uploads via the Files API.
+// convertBetaToolResultBlock converts a tool message to a Beta API tool_result block,
+// including any image content from MultiContent.
+func convertBetaToolResultBlock(msg *chat.Message) anthropic.BetaContentBlockParamUnion {
+	if !hasImageMultiContent(msg.MultiContent) {
+		// tool_result must be present for every preceding tool_use; we cannot skip
+		// it. Normalize whitespace-only content to empty string rather than skipping.
+		content := msg.Content
+		if strings.TrimSpace(content) == "" {
+			content = ""
+		}
+		return anthropic.BetaContentBlockParamUnion{
+			OfToolResult: &anthropic.BetaToolResultBlockParam{
+				ToolUseID: msg.ToolCallID,
+				Content: []anthropic.BetaToolResultBlockParamContentUnion{
+					{OfText: &anthropic.BetaTextBlockParam{Text: content}},
+				},
+			},
+		}
+	}
+
+	var content []anthropic.BetaToolResultBlockParamContentUnion
+	for _, part := range msg.MultiContent {
+		switch part.Type {
+		case chat.MessagePartTypeText:
+			content = append(content, anthropic.BetaToolResultBlockParamContentUnion{
+				OfText: &anthropic.BetaTextBlockParam{Text: part.Text},
+			})
+		case chat.MessagePartTypeImageURL:
+			// Note: superseded by MessagePartTypeDocument.
+			if part.ImageURL == nil {
+				continue
+			}
+			if strings.HasPrefix(part.ImageURL.URL, "data:") {
+				urlParts := strings.SplitN(part.ImageURL.URL, ",", 2)
+				if len(urlParts) == 2 {
+					mediaType := extractMediaType(urlParts[0])
+					content = append(content, anthropic.BetaToolResultBlockParamContentUnion{
+						OfImage: &anthropic.BetaImageBlockParam{
+							Source: anthropic.BetaImageBlockParamSourceUnion{
+								OfBase64: &anthropic.BetaBase64ImageSourceParam{
+									Data:      urlParts[1],
+									MediaType: anthropic.BetaBase64ImageSourceMediaType(mediaType),
+								},
+							},
+						},
+					})
+				}
+			}
+		}
+	}
+
+	return anthropic.BetaContentBlockParamUnion{
+		OfToolResult: &anthropic.BetaToolResultBlockParam{
+			ToolUseID: msg.ToolCallID,
+			Content:   content,
+		},
+	}
+}
+
 func (c *Client) convertBetaUserMultiContent(ctx context.Context, parts []chat.MessagePart) ([]anthropic.BetaContentBlockParamUnion, error) {
 	contentBlocks := make([]anthropic.BetaContentBlockParamUnion, 0, len(parts))
 
 	for _, part := range parts {
 		switch part.Type {
 		case chat.MessagePartTypeText:
-			if txt := strings.TrimSpace(part.Text); txt != "" {
-				contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
-					OfText: &anthropic.BetaTextBlockParam{Text: txt},
-				})
-			}
+			contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
+				OfText: &anthropic.BetaTextBlockParam{Text: part.Text},
+			})
 
 		case chat.MessagePartTypeImageURL:
 			if part.ImageURL == nil {
@@ -167,22 +211,8 @@ func (c *Client) convertBetaUserMultiContent(ctx context.Context, parts []chat.M
 			if strings.HasPrefix(part.ImageURL.URL, "data:") {
 				urlParts := strings.SplitN(part.ImageURL.URL, ",", 2)
 				if len(urlParts) == 2 {
-					mediaTypePart := urlParts[0]
+					mediaType := extractMediaType(urlParts[0])
 					base64Data := urlParts[1]
-
-					var mediaType string
-					switch {
-					case strings.Contains(mediaTypePart, "image/jpeg"):
-						mediaType = "image/jpeg"
-					case strings.Contains(mediaTypePart, "image/png"):
-						mediaType = "image/png"
-					case strings.Contains(mediaTypePart, "image/gif"):
-						mediaType = "image/gif"
-					case strings.Contains(mediaTypePart, "image/webp"):
-						mediaType = "image/webp"
-					default:
-						mediaType = "image/jpeg"
-					}
 
 					contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
 						OfImage: &anthropic.BetaImageBlockParam{
@@ -209,6 +239,7 @@ func (c *Client) convertBetaUserMultiContent(ctx context.Context, parts []chat.M
 			}
 
 		case chat.MessagePartTypeFile:
+			// Note: superseded by MessagePartTypeDocument.
 			if part.File == nil {
 				continue
 			}
@@ -241,7 +272,16 @@ func (c *Client) convertBetaUserMultiContent(ctx context.Context, parts []chat.M
 
 			default:
 				// File part has neither path nor file ID - this is invalid
-				return nil, fmt.Errorf("invalid file attachment: neither path nor file_id provided")
+				return nil, errors.New("invalid file attachment: neither path nor file_id provided")
+			}
+
+		case chat.MessagePartTypeDocument:
+			if part.Document != nil {
+				stdBlocks, err := c.convertDoc(ctx, *part.Document)
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert document attachment %q: %w", part.Document.Name, err)
+				}
+				contentBlocks = append(contentBlocks, stdBlocksToBeta(stdBlocks)...)
 			}
 		}
 	}
@@ -351,4 +391,44 @@ func applyBetaMessageCacheControl(messages []anthropic.BetaMessageParam) {
 			block.OfDocument.CacheControl = cacheCtrl
 		}
 	}
+}
+
+// stdBlocksToBeta converts standard Anthropic SDK content blocks to their Beta
+// API equivalents. The beta path (convertBetaUserMultiContent) requires
+// BetaContentBlockParamUnion, but convertDocument produces the standard type.
+// The two types are structurally identical for the block kinds we produce
+// (text, image, document), so we field-map them here.
+func stdBlocksToBeta(blocks []anthropic.ContentBlockParamUnion) []anthropic.BetaContentBlockParamUnion {
+	out := make([]anthropic.BetaContentBlockParamUnion, 0, len(blocks))
+	for _, b := range blocks {
+		switch {
+		case b.OfText != nil:
+			out = append(out, anthropic.BetaContentBlockParamUnion{
+				OfText: &anthropic.BetaTextBlockParam{Text: b.OfText.Text},
+			})
+		case b.OfImage != nil && b.OfImage.Source.OfBase64 != nil:
+			out = append(out, anthropic.BetaContentBlockParamUnion{
+				OfImage: &anthropic.BetaImageBlockParam{
+					Source: anthropic.BetaImageBlockParamSourceUnion{
+						OfBase64: &anthropic.BetaBase64ImageSourceParam{
+							Data:      b.OfImage.Source.OfBase64.Data,
+							MediaType: anthropic.BetaBase64ImageSourceMediaType(b.OfImage.Source.OfBase64.MediaType),
+						},
+					},
+				},
+			})
+		case b.OfDocument != nil && b.OfDocument.Source.OfBase64 != nil:
+			out = append(out, anthropic.BetaContentBlockParamUnion{
+				OfDocument: &anthropic.BetaRequestDocumentBlockParam{
+					Source: anthropic.BetaRequestDocumentBlockSourceUnionParam{
+						OfBase64: &anthropic.BetaBase64PDFSourceParam{
+							Data: b.OfDocument.Source.OfBase64.Data,
+						},
+					},
+				},
+			})
+		}
+		// Unknown block kinds are dropped (should never happen in Phase 1).
+	}
+	return out
 }

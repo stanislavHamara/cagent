@@ -6,13 +6,13 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/tools/builtin"
-	"github.com/docker/cagent/pkg/tui/components/spinner"
-	"github.com/docker/cagent/pkg/tui/components/toolcommon"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/styles"
-	"github.com/docker/cagent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
+	"github.com/docker/docker-agent/pkg/tui/components/spinner"
+	"github.com/docker/docker-agent/pkg/tui/components/toolcommon"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	"github.com/docker/docker-agent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/types"
 )
 
 func New(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
@@ -20,14 +20,14 @@ func New(msg *types.Message, sessionState service.SessionStateReader) layout.Mod
 }
 
 func render(msg *types.Message, _ spinner.Spinner, _ service.SessionStateReader, width, _ int) string {
-	var params builtin.TransferTaskArgs
+	var params transfertask.Args
 	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &params); err != nil {
 		return ""
 	}
 
-	header := styles.AgentBadgeStyle.MarginLeft(2).Render(msg.Sender) +
+	header := styles.AgentBadgeStyleFor(msg.Sender).MarginLeft(2).Render(msg.Sender) +
 		" calls " +
-		styles.AgentBadgeStyle.Render(params.Agent)
+		styles.AgentBadgeStyleFor(params.Agent).Render(params.Agent)
 
 	// Calculate the icon with its margin
 	icon := styles.ToolCompletedIcon.Render("✓")

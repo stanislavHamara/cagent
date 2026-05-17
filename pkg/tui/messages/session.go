@@ -1,7 +1,6 @@
-// Package messages defines all TUI message types organized by domain.
 package messages
 
-import "github.com/docker/cagent/pkg/session"
+import "github.com/docker/docker-agent/pkg/session"
 
 // Attachment represents content attached to a message. It is either a reference
 // to a file on disk (FilePath is set) or inline content already in memory
@@ -26,6 +25,10 @@ type (
 	// NewSessionMsg requests creation of a new session.
 	NewSessionMsg struct{}
 
+	// ClearSessionMsg resets the current tab and starts a new session
+	// in the same working directory.
+	ClearSessionMsg struct{}
+
 	// ExitSessionMsg requests exiting the current session.
 	ExitSessionMsg struct{}
 
@@ -44,6 +47,18 @@ type (
 	// CopyLastResponseToClipboardMsg copies the last assistant response to clipboard.
 	CopyLastResponseToClipboardMsg struct{}
 
+	// UndoSnapshotMsg restores files from the latest snapshot.
+	UndoSnapshotMsg struct{}
+
+	// ShowSnapshotsDialogMsg requests opening the snapshots dialog.
+	ShowSnapshotsDialogMsg struct{}
+
+	// ResetSnapshotMsg requests restoring the workspace to a snapshot.
+	// Keep is the number of snapshots to retain in chronological order:
+	// 0 reverts every snapshot (back to the original pre-agent state),
+	// N keeps snapshots 1..N and reverts any later ones.
+	ResetSnapshotMsg struct{ Keep int }
+
 	// ExportSessionMsg exports the session to the specified file.
 	ExportSessionMsg struct{ Filename string }
 
@@ -56,11 +71,17 @@ type (
 	// ToggleSessionStarMsg toggles star on a session; empty ID means current session.
 	ToggleSessionStarMsg struct{ SessionID string }
 
+	// DeleteSessionMsg deletes a session by ID.
+	DeleteSessionMsg struct{ SessionID string }
+
 	// SetSessionTitleMsg sets the session title to specified value.
 	SetSessionTitleMsg struct{ Title string }
 
 	// RegenerateTitleMsg regenerates the session title using the AI.
 	RegenerateTitleMsg struct{}
+
+	// ForkSessionMsg requests forking the current session into a new tab.
+	ForkSessionMsg struct{}
 
 	// StreamCancelledMsg notifies components that the stream has been cancelled.
 	StreamCancelledMsg struct{ ShowMessage bool }

@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/modelsdev"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 )
 
 // ResolveModelAliases resolves model aliases to their pinned versions in the config.
@@ -23,7 +23,7 @@ func ResolveModelAliases(ctx context.Context, cfg *latest.Config, store *modelsd
 		// Skip alias resolution for models with custom base_url (direct or via provider)
 		// Custom endpoints like Azure Foundry use alias names as deployment names
 		if hasCustomBaseURL(&modelCfg, cfg.Providers) {
-			slog.Debug("Skipping model alias resolution for model with custom base_url",
+			slog.DebugContext(ctx, "Skipping model alias resolution for model with custom base_url",
 				"model_name", name, "provider", modelCfg.Provider, "model", modelCfg.Model)
 			continue
 		}
@@ -43,28 +43,6 @@ func ResolveModelAliases(ctx context.Context, cfg *latest.Config, store *modelsd
 			}
 		}
 		cfg.Models[name] = modelCfg
-	}
-
-	// Resolve inline model references in agents (e.g., "anthropic/claude-sonnet-4-5")
-	for _, agent := range cfg.Agents {
-		if agent.Model == "" || agent.Model == "auto" {
-			continue
-		}
-
-		var resolvedModels []string
-		for modelRef := range strings.SplitSeq(agent.Model, ",") {
-			if provider, model, ok := strings.Cut(modelRef, "/"); ok {
-				if resolved := store.ResolveModelAlias(ctx, provider, model); resolved != model {
-					resolvedModels = append(resolvedModels, provider+"/"+resolved)
-					continue
-				}
-			}
-			resolvedModels = append(resolvedModels, modelRef)
-		}
-
-		cfg.Agents.Update(agent.Name, func(a *latest.AgentConfig) {
-			a.Model = strings.Join(resolvedModels, ",")
-		})
 	}
 }
 

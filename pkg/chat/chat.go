@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 // MaxInlineFileSize is the maximum size of a text file that can be inlined
@@ -29,9 +29,11 @@ const (
 type MessagePartType string
 
 const (
-	MessagePartTypeText     MessagePartType = "text"
+	MessagePartTypeText MessagePartType = "text"
+	// MessagePartTypeImageURL is superseded by MessagePartTypeDocument. Will be removed in a future release.
 	MessagePartTypeImageURL MessagePartType = "image_url"
-	MessagePartTypeFile     MessagePartType = "file"
+	// MessagePartTypeFile is superseded by MessagePartTypeDocument. Will be removed in a future release.
+	MessagePartTypeFile MessagePartType = "file"
 )
 
 type ImageURLDetail string
@@ -89,6 +91,11 @@ type Message struct {
 	// Cost is the cost of this message in dollars (only set for assistant messages)
 	Cost float64 `json:"cost,omitempty"`
 
+	// FinishReason indicates why the model stopped generating for this message.
+	// "stop" = natural end, "tool_calls" = tool invocation, "length" = token limit.
+	// Only set for assistant messages.
+	FinishReason FinishReason `json:"finish_reason,omitempty"`
+
 	// CacheControl indicates whether this message is a cached message (only used by anthropic)
 	CacheControl bool `json:"cache_control,omitempty"`
 }
@@ -101,10 +108,14 @@ type MessageFile struct {
 }
 
 type MessagePart struct {
-	Type     MessagePartType  `json:"type,omitempty"`
-	Text     string           `json:"text,omitempty"`
+	Type MessagePartType `json:"type,omitempty"`
+	Text string          `json:"text,omitempty"`
+	// Note: superseded by Document+MessagePartTypeDocument. Will be removed in a future release.
 	ImageURL *MessageImageURL `json:"image_url,omitempty"`
-	File     *MessageFile     `json:"file,omitempty"`
+	// Note: superseded by Document+MessagePartTypeDocument. Will be removed in a future release.
+	File *MessageFile `json:"file,omitempty"`
+	// Document is set when Type is MessagePartTypeDocument.
+	Document *Document `json:"document,omitempty"`
 }
 
 // FinishReason represents the reason why the model finished generating a response
@@ -141,13 +152,12 @@ type MessageStreamChoice struct {
 
 // MessageStreamResponse represents a streaming response from the model
 type MessageStreamResponse struct {
-	ID        string                `json:"id"`
-	Object    string                `json:"object"`
-	Created   int64                 `json:"created"`
-	Model     string                `json:"model"`
-	Choices   []MessageStreamChoice `json:"choices"`
-	Usage     *Usage                `json:"usage,omitempty"`
-	RateLimit *RateLimit            `json:"rate_limit,omitempty"`
+	ID      string                `json:"id"`
+	Object  string                `json:"object"`
+	Created int64                 `json:"created"`
+	Model   string                `json:"model"`
+	Choices []MessageStreamChoice `json:"choices"`
+	Usage   *Usage                `json:"usage,omitempty"`
 }
 
 type Usage struct {
@@ -158,13 +168,6 @@ type Usage struct {
 	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
 }
 
-type RateLimit struct {
-	Limit      int64 `json:"limit,omitempty"`
-	Remaining  int64 `json:"remaining,omitempty"`
-	Reset      int64 `json:"reset,omitempty"`
-	RetryAfter int64 `json:"retry_after,omitempty"`
-}
-
 // MessageStream interface represents a stream of chat completions
 type MessageStream interface {
 	// Recv gets the next completion chunk
@@ -173,32 +176,56 @@ type MessageStream interface {
 	Close()
 }
 
-// DetectMimeType returns the MIME type for a file based on its extension.
-// This is the canonical implementation used across all packages for consistency.
-// For binary file types (images, PDF), returns the specific MIME type.
-// For text-based files, returns "text/plain".
-// Unrecognized extensions return "application/octet-stream".
+// DetectMimeType returns the MIME type for a file by reading its first 512
+// bytes and inspecting the content (magic bytes). For text-based files that
+// http.DetectContentType cannot distinguish (e.g. source code vs plain text),
+// it falls back to extension matching. This is the canonical implementation
+// used across all packages for consistency.
 func DetectMimeType(filePath string) string {
-	ext := strings.ToLower(filepath.Ext(filePath))
-	switch ext {
-	// Images
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	// PDF
-	case ".pdf":
-		return "application/pdf"
-	default:
-		if isTextExtension(ext) {
-			return "text/plain"
-		}
+	// Content sniffing — reliably detects images, PDF, etc.
+	if ct := detectMimeTypeFromFile(filePath); ct != "application/octet-stream" {
+		return ct
+	}
+
+	// http.DetectContentType returns "application/octet-stream" for text
+	// files it can't classify, so fall back to extension for those.
+	if isTextExtension(strings.ToLower(filepath.Ext(filePath))) {
+		return "text/plain"
+	}
+	return "application/octet-stream"
+}
+
+// detectMimeTypeFromFile reads the first 512 bytes of a file and uses
+// content-based detection (magic bytes) to determine the MIME type.
+func detectMimeTypeFromFile(filePath string) string {
+	f, err := os.Open(filePath)
+	if err != nil {
 		return "application/octet-stream"
 	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	if n == 0 {
+		return "application/octet-stream"
+	}
+	return DetectMimeTypeByContent(buf[:n])
+}
+
+// IsImageMimeType returns true if the MIME type is a supported image type.
+func IsImageMimeType(mimeType string) bool {
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsImageFile returns true if the file at the given path is a supported image
+// based on its extension. Supported formats: JPEG, PNG, GIF, WebP.
+func IsImageFile(filePath string) bool {
+	return IsImageMimeType(DetectMimeType(filePath))
 }
 
 // IsSupportedMimeType returns true if the MIME type is supported for file attachments.

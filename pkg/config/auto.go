@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/environment"
 )
 
 // providerConfig defines a cloud provider and how to detect/describe its API keys.
@@ -46,17 +46,15 @@ func (e *AutoModelFallbackError) Error() string {
 		hints = append(hints, fmt.Sprintf("    - %s: %s", p.name, p.hint))
 	}
 
-	return fmt.Sprintf(`No model providers available.
-
-To fix this, you can:
-  - Install Docker Model Runner: https://docs.docker.com/ai/model-runner/get-started/
-  - Configure an API key for a cloud provider:
-%s`, strings.Join(hints, "\n"))
+	return "No model providers available.\n\nTo fix this, you can:\n" +
+		"  - Install Docker Model Runner: https://docs.docker.com/ai/model-runner/get-started/\n" +
+		"  - Configure an API key for a cloud provider:\n" +
+		strings.Join(hints, "\n")
 }
 
 var DefaultModels = map[string]string{
 	"openai":         "gpt-5-mini",
-	"anthropic":      "claude-sonnet-4-5",
+	"anthropic":      "claude-sonnet-4-6",
 	"google":         "gemini-2.5-flash",
 	"dmr":            "ai/qwen3:latest",
 	"mistral":        "mistral-small-latest",

@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 func TestMakeAllRequired(t *testing.T) {
@@ -167,6 +167,48 @@ func TestMakeAllRequired_ArrayItems(t *testing.T) {
 	assert.Contains(t, itemRequired, "name")
 }
 
+func TestMakeAllRequired_AdditionalProperties(t *testing.T) {
+	// Reproduces the Notion MCP tool schema where additionalProperties
+	// contains an object schema with its own properties (like bulleted_list_item).
+	// OpenAI requires all properties in additionalProperties schemas to also
+	// be listed in the required array.
+	schema := shared.FunctionParameters{
+		"type": "object",
+		"properties": map[string]any{
+			"children": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"bulleted_list_item": map[string]any{"type": "string"},
+						"numbered_list_item": map[string]any{"type": "string"},
+					},
+					"required": []any{"bulleted_list_item"},
+				},
+			},
+		},
+		"required": []any{"children"},
+	}
+
+	updated := makeAllRequired(schema)
+
+	// additionalProperties object: all properties must be required
+	children := updated["properties"].(map[string]any)["children"].(map[string]any)
+	additionalProps := children["additionalProperties"].(map[string]any)
+	additionalRequired := additionalProps["required"].([]any)
+	assert.Len(t, additionalRequired, 2)
+	assert.Contains(t, additionalRequired, "bulleted_list_item")
+	assert.Contains(t, additionalRequired, "numbered_list_item")
+
+	// numbered_list_item was not originally required, so its type should be nullable
+	numberedListItem := additionalProps["properties"].(map[string]any)["numbered_list_item"].(map[string]any)
+	assert.Equal(t, []string{"string", "null"}, numberedListItem["type"])
+
+	// bulleted_list_item was originally required, so its type should be unchanged
+	bulletedListItem := additionalProps["properties"].(map[string]any)["bulleted_list_item"].(map[string]any)
+	assert.Equal(t, "string", bulletedListItem["type"])
+}
+
 func TestRemoveFormatFields(t *testing.T) {
 	schema := map[string]any{
 		"type": "object",
@@ -289,6 +331,97 @@ func TestRemoveFormatFields_NoProperties(t *testing.T) {
 	schema := shared.FunctionParameters{"type": "object"}
 	updated := removeFormatFields(schema)
 	assert.Equal(t, schema, updated)
+}
+
+func TestMakeAllRequired_TypeArrayWithObject(t *testing.T) {
+	// Reproduces the user_prompt tool schema where a property has
+	// type: ["object", "null"] with nested properties. OpenAI requires
+	// these nested properties to also have additionalProperties: false.
+	schema := shared.FunctionParameters{
+		"type": "object",
+		"properties": map[string]any{
+			"schema": map[string]any{
+				"type": []string{"object", "null"},
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+					"age":  map[string]any{"type": "number"},
+				},
+				"required": []any{"name"},
+			},
+		},
+		"required": []any{"schema"},
+	}
+
+	updated := makeAllRequired(schema)
+
+	// Top-level should have additionalProperties: false
+	assert.Equal(t, false, updated["additionalProperties"])
+
+	// The schema property should also have additionalProperties: false
+	schemaProps := updated["properties"].(map[string]any)["schema"].(map[string]any)
+	assert.Equal(t, false, schemaProps["additionalProperties"])
+
+	// All properties in schema should be required
+	schemaRequired := schemaProps["required"].([]any)
+	assert.Len(t, schemaRequired, 2)
+	assert.Contains(t, schemaRequired, "name")
+	assert.Contains(t, schemaRequired, "age")
+
+	// age was not originally required, so its type should be nullable
+	age := schemaProps["properties"].(map[string]any)["age"].(map[string]any)
+	assert.Equal(t, []string{"number", "null"}, age["type"])
+}
+
+func TestEnsureTypeFields_AdditionalPropertiesMissingType(t *testing.T) {
+	// Reproduces the Notion MCP notion-search tool schema where
+	// filters.additionalProperties is an object schema without a "type" key.
+	// OpenAI Responses API rejects schemas missing "type".
+	schema := shared.FunctionParameters{
+		"type": "object",
+		"properties": map[string]any{
+			"filters": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					// No "type" key here — this is the bug
+					"properties": map[string]any{
+						"property": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+		"required": []any{"filters"},
+	}
+
+	updated := ensureTypeFields(schema)
+
+	filters := updated["properties"].(map[string]any)["filters"].(map[string]any)
+	additionalProps := filters["additionalProperties"].(map[string]any)
+	assert.Equal(t, "object", additionalProps["type"], "additionalProperties should have type added")
+}
+
+func TestConvertParametersToSchema_AdditionalPropertiesMissingType(t *testing.T) {
+	// End-to-end test: the full pipeline should produce a valid schema
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"filters": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					"properties": map[string]any{
+						"property": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+		"required": []any{"filters"},
+	}
+
+	result, err := ConvertParametersToSchema(schema)
+	require.NoError(t, err)
+
+	filters := result["properties"].(map[string]any)["filters"].(map[string]any)
+	additionalProps := filters["additionalProperties"].(map[string]any)
+	assert.Equal(t, "object", additionalProps["type"])
 }
 
 func TestFixSchemaArrayItems(t *testing.T) {

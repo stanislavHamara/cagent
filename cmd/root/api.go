@@ -1,20 +1,21 @@
 package root
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/docker/cagent/pkg/cli"
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/connectrpc"
-	"github.com/docker/cagent/pkg/server"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/telemetry"
+	"github.com/docker/docker-agent/pkg/cli"
+	"github.com/docker/docker-agent/pkg/config"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/server"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/telemetry"
 )
 
 type apiFlags struct {
@@ -23,8 +24,7 @@ type apiFlags struct {
 	pullIntervalMins int
 	fakeResponses    string
 	recordPath       string
-	connectRPC       bool
-	exitOnStdinEOF   bool
+	authToken        string
 	runConfig        config.RuntimeConfig
 }
 
@@ -33,8 +33,7 @@ func newAPICmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "api <agent-file>|<agents-dir>",
-		Short: "Start the cagent API server",
-		Long:  `Start the API server that exposes the agent via a cagent-specific HTTP API`,
+		Short: "Start the API server",
 		Args:  cobra.ExactArgs(1),
 		RunE:  flags.runAPICommand,
 	}
@@ -44,69 +43,25 @@ func newAPICmd() *cobra.Command {
 	cmd.PersistentFlags().IntVar(&flags.pullIntervalMins, "pull-interval", 0, "Auto-pull OCI reference every N minutes (0 = disabled)")
 	cmd.PersistentFlags().StringVar(&flags.fakeResponses, "fake", "", "Replay AI responses from cassette file (for testing)")
 	cmd.PersistentFlags().StringVar(&flags.recordPath, "record", "", "Record AI API interactions to cassette file")
-	cmd.PersistentFlags().BoolVar(&flags.connectRPC, "connect-rpc", false, "Use Connect-RPC protocol instead of HTTP/JSON API")
-	cmd.PersistentFlags().BoolVar(&flags.exitOnStdinEOF, "exit-on-stdin-eof", false, "Exit when stdin is closed (for integration with parent processes)")
-	_ = cmd.PersistentFlags().MarkHidden("exit-on-stdin-eof")
+	cmd.PersistentFlags().StringVar(&flags.authToken, "auth-token", "", "Bearer token required for API requests (empty = no authentication)")
 	cmd.MarkFlagsMutuallyExclusive("fake", "record")
 	addRuntimeConfigFlags(cmd, &flags.runConfig)
 
 	return cmd
 }
 
-// monitorStdin monitors stdin for EOF, which indicates the parent process has died.
-// When spawned with piped stdio, stdin closes when the parent process dies.
-// The caller is responsible for cancelling the context (e.g. via defer cancel()).
-func monitorStdin(ctx context.Context, cancel context.CancelFunc, stdin *os.File) {
-	done := make(chan struct{})
-
-	// Close stdin when context is cancelled to unblock the read.
-	// Also exits cleanly when monitorStdin returns.
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-done:
-		}
-		stdin.Close()
-	}()
-
-	defer close(done)
-
-	buf := make([]byte, 1)
-	for {
-		n, err := stdin.Read(buf)
-		if err != nil || n == 0 {
-			if ctx.Err() == nil {
-				slog.Info("stdin closed, parent process likely died, shutting down")
-				cancel()
-			}
-			return
-		}
-	}
-}
-
-func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("serve", append([]string{"api"}, args...))
-
+func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr error) {
 	ctx := cmd.Context()
-
-	// Save stdin before clearing it, so we can optionally monitor for parent process death
-	stdin := os.Stdin
+	telemetry.TrackCommand(ctx, "serve", append([]string{"api"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(ctx, "serve", append([]string{"api"}, args...), commandErr)
+	}()
 
 	out := cli.NewPrinter(cmd.OutOrStdout())
 	agentsPath := args[0]
 
 	// Make sure no question is ever asked to the user in api mode.
 	os.Stdin = nil
-
-	// Monitor stdin for EOF to detect parent process death.
-	// Only enabled when --exit-on-stdin-eof flag is passed.
-	// When spawned with piped stdio, stdin closes when the parent process dies.
-	if f.exitOnStdinEOF {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-		go monitorStdin(ctx, cancel, stdin)
-	}
 
 	// Start fake proxy if --fake is specified
 	cleanup, err := setupFakeProxy(f.fakeResponses, 0, &f.runConfig)
@@ -115,36 +70,38 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) error {
 	}
 	defer func() {
 		if err := cleanup(); err != nil {
-			slog.Error("Failed to cleanup fake proxy", "error", err)
+			slog.ErrorContext(ctx, "Failed to cleanup fake proxy", "error", err)
 		}
 	}()
 
 	// Start recording proxy if --record is specified
-	if _, recordCleanup, err := setupRecordingProxy(f.recordPath, &f.runConfig); err != nil {
-		return err
-	} else {
-		defer func() {
-			if err := recordCleanup(); err != nil {
-				slog.Error("Failed to cleanup recording proxy", "error", err)
-			}
-		}()
-	}
-
-	if f.pullIntervalMins > 0 && !config.IsOCIReference(agentsPath) {
-		return fmt.Errorf("--pull-interval flag can only be used with OCI references, not local files")
-	}
-
-	ln, err := listenAndCloseOnCancel(ctx, f.listenAddr)
+	_, recordCleanup, err := setupRecordingProxy(f.recordPath, &f.runConfig)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := recordCleanup(); err != nil {
+			slog.ErrorContext(ctx, "Failed to cleanup recording proxy", "error", err)
+		}
+	}()
+
+	if f.pullIntervalMins > 0 && !config.IsOCIReference(agentsPath) && !config.IsURLReference(agentsPath) {
+		return errors.New("--pull-interval flag can only be used with OCI or URL references, not local files")
+	}
+
+	ln, lnCleanup, err := newListener(ctx, f.listenAddr)
+	if err != nil {
+		return err
+	}
+	defer lnCleanup()
 
 	out.Println("Listening on", ln.Addr().String())
+	warnIfNotLoopback(out, ln.Addr())
 
-	slog.Debug("Starting server", "agents", agentsPath, "addr", ln.Addr().String())
+	slog.DebugContext(ctx, "Starting server", "agents", agentsPath, "addr", ln.Addr().String())
 
 	// Expand tilde in session database path
-	sessionDB, err := expandTilde(f.sessionDB)
+	sessionDB, err := pathx.ExpandHomeDir(f.sessionDB)
 	if err != nil {
 		return err
 	}
@@ -155,7 +112,7 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) error {
 	}
 	defer func() {
 		if err := sessionStore.Close(); err != nil {
-			slog.Error("Failed to close session store", "error", err)
+			slog.ErrorContext(ctx, "Failed to close session store", "error", err)
 		}
 	}()
 
@@ -164,18 +121,29 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving agent sources: %w", err)
 	}
 
-	if f.connectRPC {
-		s, err := connectrpc.New(ctx, sessionStore, &f.runConfig, time.Duration(f.pullIntervalMins)*time.Minute, sources)
-		if err != nil {
-			return fmt.Errorf("creating Connect-RPC server: %w", err)
-		}
-		return s.Serve(ctx, ln)
-	}
-
-	s, err := server.New(ctx, sessionStore, &f.runConfig, time.Duration(f.pullIntervalMins)*time.Minute, sources)
+	s, err := server.New(ctx, sessionStore, &f.runConfig, time.Duration(f.pullIntervalMins)*time.Minute, sources, f.authToken)
 	if err != nil {
 		return fmt.Errorf("creating server: %w", err)
 	}
 
 	return s.Serve(ctx, ln)
+}
+
+// warnIfNotLoopback prints a security warning when the API server is bound to
+// an address other than loopback. The default --listen value is 127.0.0.1, so
+// reaching this code path means the operator was explicit about exposing the
+// API; we just remind them that the API has no authentication.
+func warnIfNotLoopback(out *cli.Printer, addr net.Addr) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		// Unix sockets and named pipes rely on filesystem permissions.
+		return
+	}
+	if tcpAddr.IP.IsLoopback() {
+		return
+	}
+	out.Println("WARNING: API server is listening on a non-loopback address.")
+	out.Println("         The API has no authentication; anyone able to reach")
+	out.Println("         this address can run agents and access all sessions.")
+	slog.Warn("API server bound to non-loopback address", "addr", tcpAddr.String())
 }

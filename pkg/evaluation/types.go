@@ -4,13 +4,23 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/docker-agent/pkg/session"
 )
 
 // InputSession wraps a session with its source path for evaluation loading.
 type InputSession struct {
 	*session.Session
-	SourcePath string // Path to the source eval file (not serialized)
+
+	SourcePath  string // Path to the source eval file (not serialized)
+	RepeatIndex int    // Repeat iteration (1-based); 0 means no repeat
+}
+
+// displayTitle returns the title with an optional repeat suffix.
+func (s *InputSession) displayTitle() string {
+	if s.RepeatIndex > 0 {
+		return fmt.Sprintf("%s #%d", s.Title, s.RepeatIndex)
+	}
+	return s.Title
 }
 
 // Result contains the evaluation results for a single test case.
@@ -25,10 +35,9 @@ type Result struct {
 	SizeExpected      string            `json:"size_expected"`
 	ToolCallsScore    float64           `json:"tool_calls_score"`
 	ToolCallsExpected float64           `json:"tool_calls_score_expected"`
-	HandoffsMatch     bool              `json:"handoffs"`
 	RelevancePassed   float64           `json:"relevance"`
 	RelevanceExpected float64           `json:"relevance_expected"`
-	FailedRelevance   []RelevanceResult `json:"failed_relevance,omitempty"`
+	RelevanceResults  []RelevanceResult `json:"relevance_results,omitempty"`
 	Error             string            `json:"error,omitempty"`
 	RawOutput         []map[string]any  `json:"raw_output,omitempty"`
 	Session           *session.Session  `json:"-"` // Full session for database storage (not in JSON)
@@ -43,7 +52,7 @@ func (r *Result) checkResults() (successes, failures []string) {
 	// Check size
 	if r.SizeExpected != "" {
 		if r.SizeExpected == r.Size {
-			successes = append(successes, fmt.Sprintf("size %s", r.Size))
+			successes = append(successes, "size "+r.Size)
 		} else {
 			failures = append(failures, fmt.Sprintf("size expected %s, got %s", r.SizeExpected, r.Size))
 		}
@@ -58,23 +67,18 @@ func (r *Result) checkResults() (successes, failures []string) {
 		}
 	}
 
-	// Check handoffs
-	if r.HandoffsMatch {
-		successes = append(successes, "handoffs")
-	} else {
-		failures = append(failures, "handoffs mismatch")
-	}
-
 	// Check relevance
 	if r.RelevanceExpected > 0 {
 		if r.RelevancePassed >= r.RelevanceExpected {
 			successes = append(successes, fmt.Sprintf("relevance %.0f/%.0f", r.RelevancePassed, r.RelevanceExpected))
 		} else {
-			for _, result := range r.FailedRelevance {
-				if result.Reason != "" {
-					failures = append(failures, fmt.Sprintf("relevance: %s (reason: %s)", result.Criterion, result.Reason))
-				} else {
-					failures = append(failures, fmt.Sprintf("relevance: %s", result.Criterion))
+			for _, result := range r.RelevanceResults {
+				if !result.Passed {
+					if result.Reason != "" {
+						failures = append(failures, fmt.Sprintf("relevance: %s (reason: %s)", result.Criterion, result.Reason))
+					} else {
+						failures = append(failures, "relevance: "+result.Criterion)
+					}
 				}
 			}
 		}
@@ -92,8 +96,6 @@ type Summary struct {
 	SizesTotal      int     `json:"sizes_total"`
 	ToolsF1Sum      float64 `json:"tools_f1_sum"`
 	ToolsCount      int     `json:"tools_count"`
-	HandoffsPassed  int     `json:"handoffs_passed"`
-	HandoffsTotal   int     `json:"handoffs_total"`
 	RelevancePassed float64 `json:"relevance_passed"`
 	RelevanceTotal  float64 `json:"relevance_total"`
 }
@@ -103,8 +105,28 @@ type EvalRun struct {
 	Name      string        `json:"name"`
 	Timestamp time.Time     `json:"timestamp"`
 	Duration  time.Duration `json:"duration"`
+	Config    Config        `json:"-"` // Used to build RunOutput, not serialized directly
 	Results   []Result      `json:"results"`
 	Summary   Summary       `json:"summary"`
+}
+
+// RunOutput is the top-level structure for the evaluation run JSON output.
+type RunOutput struct {
+	Name      string             `json:"name"`
+	Timestamp time.Time          `json:"timestamp"`
+	Duration  string             `json:"duration"`
+	Config    RunOutputConfig    `json:"config"`
+	Summary   Summary            `json:"summary"`
+	Sessions  []*session.Session `json:"sessions"`
+}
+
+// RunOutputConfig captures the evaluation run configuration.
+type RunOutputConfig struct {
+	Agent       string `json:"agent"`
+	JudgeModel  string `json:"judge_model,omitempty"`
+	Concurrency int    `json:"concurrency"`
+	EvalsDir    string `json:"evals_dir"`
+	BaseImage   string `json:"base_image,omitempty"`
 }
 
 // Config holds configuration for evaluation runs.
@@ -118,6 +140,7 @@ type Config struct {
 	BaseImage      string   // Custom base Docker image for running evaluations
 	KeepContainers bool     // If true, don't remove containers after evaluation (skip --rm)
 	EnvVars        []string // Environment variables to pass: KEY (value from env) or KEY=VALUE (explicit)
+	Repeat         int      // Number of times to repeat each evaluation (default 1)
 }
 
 // Session helper functions

@@ -7,9 +7,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/tui/animation"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/animation"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 type Mode int
@@ -23,6 +23,8 @@ type Spinner interface {
 	layout.Model
 	Reset() Spinner
 	Stop()
+	// RawFrame returns the current spinner character without any styling applied.
+	RawFrame() string
 }
 type spinner struct {
 	animSub             *animation.Subscription // manages animation tick subscription
@@ -69,8 +71,8 @@ var defaultMessages = []string{
 
 func New(mode Mode, dotsStyle lipgloss.Style) Spinner {
 	// Pre-render all spinner frames for fast lookup during render
-	styledFrames := make([]string, len(spinnerChars))
-	for i, char := range spinnerChars {
+	styledFrames := make([]string, len(spinnerFrames))
+	for i, char := range spinnerFrames {
 		styledFrames[i] = dotsStyle.Render(char)
 	}
 
@@ -136,7 +138,18 @@ func (s *spinner) Stop() {
 	s.animSub.Stop()
 }
 
-var spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+// RawFrame returns the current spinner character without any styling applied.
+func (s *spinner) RawFrame() string {
+	return spinnerFrames[s.frame%len(spinnerFrames)]
+}
+
+// spinnerFrames holds the animation frames for the current terminal.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// Frame returns the spinner character for the given animation frame.
+func Frame(index int) string {
+	return spinnerFrames[index%len(spinnerFrames)]
+}
 
 // lightStyles maps distance from light position to style (0=brightest, 1=bright, 2=dim, 3+=dimmest).
 var lightStyles = []lipgloss.Style{

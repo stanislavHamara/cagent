@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/config/latest"
 )
 
 func TestConfig_Empty(t *testing.T) {
@@ -523,6 +523,29 @@ func TestConfig_Settings_Empty(t *testing.T) {
 	settings := config.GetSettings()
 	assert.NotNil(t, settings)
 	assert.False(t, settings.HideToolResults)
+	assert.False(t, settings.GetExpandThinking())
+}
+
+func TestConfig_Settings_ExpandThinking(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	expandThinking := false
+
+	config := &Config{
+		Settings: &Settings{
+			ExpandThinking: &expandThinking,
+		},
+	}
+
+	require.NoError(t, config.saveTo(configFile))
+
+	loaded, err := loadFrom(configFile, "")
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Settings)
+	require.NotNil(t, loaded.Settings.ExpandThinking)
+	assert.False(t, loaded.Settings.GetExpandThinking())
 }
 
 func TestConfig_Settings_GetSettingsNil(t *testing.T) {
@@ -534,6 +557,7 @@ func TestConfig_Settings_GetSettingsNil(t *testing.T) {
 	settings := config.GetSettings()
 	assert.NotNil(t, settings)
 	assert.False(t, settings.HideToolResults)
+	assert.False(t, settings.GetExpandThinking())
 }
 
 func TestConfig_AliasWithHideToolResults(t *testing.T) {
@@ -791,6 +815,7 @@ func TestGet_Empty(t *testing.T) {
 	settings := Get()
 	require.NotNil(t, settings)
 	assert.False(t, settings.HideToolResults)
+	assert.False(t, settings.GetExpandThinking())
 }
 
 func TestGet_WithHideToolResults(t *testing.T) {
@@ -811,6 +836,48 @@ func TestGet_WithHideToolResults(t *testing.T) {
 	assert.True(t, settings.HideToolResults)
 }
 
+func TestSettings_GetSound(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		settings *Settings
+		expected bool
+	}{
+		{"nil settings", nil, false},
+		{"empty settings", &Settings{}, false},
+		{"explicitly enabled", &Settings{Sound: true}, true},
+		{"explicitly disabled", &Settings{Sound: false}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, tt.settings.GetSound())
+		})
+	}
+}
+
+func TestSettings_SnapshotsEnabled(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		settings *Settings
+		want     bool
+	}{
+		{"nil settings", nil, false},
+		{"empty settings", &Settings{}, false},
+		{"explicitly enabled", &Settings{Snapshot: new(true)}, true},
+		{"explicitly disabled", &Settings{Snapshot: new(false)}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, tt.settings.SnapshotsEnabled())
+		})
+	}
+}
+
 func TestSettings_RestoreTabs(t *testing.T) {
 	t.Parallel()
 
@@ -821,8 +888,8 @@ func TestSettings_RestoreTabs(t *testing.T) {
 	}{
 		{"nil settings", nil, false},
 		{"empty settings", &Settings{}, false},
-		{"explicitly disabled", &Settings{RestoreTabs: boolPtr(false)}, false},
-		{"explicitly enabled", &Settings{RestoreTabs: boolPtr(true)}, true},
+		{"explicitly disabled", &Settings{RestoreTabs: new(false)}, false},
+		{"explicitly enabled", &Settings{RestoreTabs: new(true)}, true},
 	}
 
 	for _, tt := range tests {
@@ -837,4 +904,34 @@ func TestSettings_RestoreTabs(t *testing.T) {
 			assert.Equal(t, tt.expected, *settings.RestoreTabs)
 		})
 	}
+}
+
+func TestConfig_PermissionsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+
+	original := &Config{
+		Aliases: make(map[string]*Alias),
+		Settings: &Settings{
+			Permissions: &latest.PermissionsConfig{
+				Allow: []string{"read_*", "shell:cmd=git*"},
+				Deny:  []string{"shell:cmd=rm*"},
+				Ask:   []string{"shell:cmd=docker*"},
+			},
+		},
+	}
+
+	err := original.saveTo(configFile)
+	require.NoError(t, err)
+
+	loaded, err := loadFrom(configFile, "")
+	require.NoError(t, err)
+
+	require.NotNil(t, loaded.Settings)
+	require.NotNil(t, loaded.Settings.Permissions)
+	assert.Equal(t, original.Settings.Permissions.Allow, loaded.Settings.Permissions.Allow)
+	assert.Equal(t, original.Settings.Permissions.Deny, loaded.Settings.Permissions.Deny)
+	assert.Equal(t, original.Settings.Permissions.Ask, loaded.Settings.Permissions.Ask)
 }

@@ -8,14 +8,14 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/creator"
-	"github.com/docker/cagent/pkg/runtime"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/telemetry"
-	"github.com/docker/cagent/pkg/tui"
-	tuiinput "github.com/docker/cagent/pkg/tui/input"
+	"github.com/docker/docker-agent/pkg/app"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/creator"
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/telemetry"
+	"github.com/docker/docker-agent/pkg/tui"
+	tuiinput "github.com/docker/docker-agent/pkg/tui/input"
 )
 
 type newFlags struct {
@@ -33,12 +33,12 @@ func newNewCmd() *cobra.Command {
 		Long: `Create a new agent configuration interactively.
 
 The agent builder will ask questions about what you want the agent to do,
-then generate a YAML configuration file you can use with 'cagent run'.
+then generate a YAML configuration file you can use with 'docker-agent run'.
 
 Optionally provide a description as an argument to skip the initial prompt.`,
-		Example: `  cagent new
-  cagent new "a web scraper that extracts product prices"
-  cagent new --model openai/gpt-4o "a code reviewer agent"`,
+		Example: `  docker-agent new
+  docker-agent new "a web scraper that extracts product prices"
+  docker-agent new --model openai/gpt-4o "a code reviewer agent"`,
 		GroupID: "core",
 		RunE:    flags.runNewCommand,
 	}
@@ -50,20 +50,18 @@ Optionally provide a description as an argument to skip the initial prompt.`,
 	return cmd
 }
 
-func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("new", args)
-
+func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) (commandErr error) {
 	ctx := cmd.Context()
+	telemetry.TrackCommand(ctx, "new", args)
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(ctx, "new", args, commandErr)
+	}()
 
 	t, err := creator.Agent(ctx, &f.runConfig, f.modelParam)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// Use a fresh context for cleanup since the original may be canceled
-		cleanupCtx := context.WithoutCancel(ctx)
-		_ = t.StopToolSets(cleanupCtx)
-	}()
+	defer stopToolSets(t)
 
 	rt, err := runtime.New(t)
 	if err != nil {
@@ -84,10 +82,10 @@ func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) error {
 
 	sess := session.New(sessOpts...)
 
-	return runTUI(ctx, rt, sess, nil, nil, appOpts...)
+	return runTUI(ctx, rt, sess, nil, nil, nil, appOpts...)
 }
 
-func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spawner tui.SessionSpawner, cleanup func(), opts ...app.Opt) error {
+func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spawner tui.SessionSpawner, cleanup func(), tuiOpts []tui.Option, opts ...app.Opt) error {
 	if gen := rt.TitleGenerator(); gen != nil {
 		opts = append(opts, app.WithTitleGenerator(gen))
 	}
@@ -110,7 +108,7 @@ func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spaw
 		cleanup = func() {}
 	}
 	wd, _ := os.Getwd()
-	model := tui.New(ctx, spawner, a, wd, cleanup)
+	model := tui.New(ctx, spawner, a, wd, cleanup, tuiOpts...)
 
 	p := tea.NewProgram(model, tea.WithContext(ctx), tea.WithFilter(filter))
 	coalescer.SetSender(p.Send)

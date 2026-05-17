@@ -3,8 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -12,23 +10,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/agent"
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/model/provider"
-	"github.com/docker/cagent/pkg/model/provider/base"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/team"
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/modelerrors"
+	"github.com/docker/docker-agent/pkg/modelsdev"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/team"
+	"github.com/docker/docker-agent/pkg/tools"
 )
-
-// mockTimeoutError implements net.Error with Timeout() = true
-type mockTimeoutError struct{}
-
-func (e *mockTimeoutError) Error() string   { return "mock timeout" }
-func (e *mockTimeoutError) Timeout() bool   { return true }
-func (e *mockTimeoutError) Temporary() bool { return true }
-
-var _ net.Error = (*mockTimeoutError)(nil)
 
 // failingProvider returns an error on CreateChatCompletionStream
 type failingProvider struct {
@@ -36,7 +27,7 @@ type failingProvider struct {
 	err error
 }
 
-func (p *failingProvider) ID() string { return p.id }
+func (p *failingProvider) ID() modelsdev.ID { return modelsdev.ParseIDOrZero(p.id) }
 func (p *failingProvider) CreateChatCompletionStream(context.Context, []chat.Message, []tools.Tool) (chat.MessageStream, error) {
 	return nil, p.err
 }
@@ -52,7 +43,7 @@ type countingProvider struct {
 	stream    chat.MessageStream
 }
 
-func (p *countingProvider) ID() string { return p.id }
+func (p *countingProvider) ID() modelsdev.ID { return modelsdev.ParseIDOrZero(p.id) }
 func (p *countingProvider) CreateChatCompletionStream(context.Context, []chat.Message, []tools.Tool) (chat.MessageStream, error) {
 	p.callCount++
 	if p.callCount <= p.failCount {
@@ -63,197 +54,12 @@ func (p *countingProvider) CreateChatCompletionStream(context.Context, []chat.Me
 func (p *countingProvider) BaseConfig() base.Config { return base.Config{} }
 func (p *countingProvider) MaxTokens() int          { return 0 }
 
-func TestIsRetryableModelError(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{
-			name:     "nil error",
-			err:      nil,
-			expected: false,
-		},
-		{
-			name:     "context canceled",
-			err:      context.Canceled,
-			expected: false,
-		},
-		{
-			name:     "context deadline exceeded",
-			err:      context.DeadlineExceeded,
-			expected: false,
-		},
-		{
-			name:     "network timeout",
-			err:      &mockTimeoutError{},
-			expected: true,
-		},
-		{
-			name:     "rate limit 429 - not retryable, skip to next model",
-			err:      errors.New("API error: status 429 too many requests"),
-			expected: false, // 429 should skip to next model, not retry same one
-		},
-		{
-			name:     "rate limit message - not retryable",
-			err:      errors.New("rate limit exceeded"),
-			expected: false, // Rate limits should skip to next model
-		},
-		{
-			name:     "too many requests - not retryable",
-			err:      errors.New("too many requests"),
-			expected: false, // Rate limits should skip to next model
-		},
-		{
-			name:     "throttling - not retryable",
-			err:      errors.New("request throttled"),
-			expected: false, // Throttling should skip to next model
-		},
-		{
-			name:     "quota exceeded - not retryable",
-			err:      errors.New("quota exceeded"),
-			expected: false, // Quota issues should skip to next model
-		},
-		{
-			name:     "server error 500",
-			err:      errors.New("internal server error 500"),
-			expected: true,
-		},
-		{
-			name:     "bad gateway 502",
-			err:      errors.New("502 bad gateway"),
-			expected: true,
-		},
-		{
-			name:     "service unavailable 503",
-			err:      errors.New("503 service unavailable"),
-			expected: true,
-		},
-		{
-			name:     "gateway timeout 504",
-			err:      errors.New("504 gateway timeout"),
-			expected: true,
-		},
-		{
-			name:     "timeout message",
-			err:      errors.New("request timeout"),
-			expected: true,
-		},
-		{
-			name:     "connection refused",
-			err:      errors.New("connection refused"),
-			expected: true,
-		},
-		{
-			name:     "unauthorized 401",
-			err:      errors.New("401 unauthorized"),
-			expected: false,
-		},
-		{
-			name:     "forbidden 403",
-			err:      errors.New("403 forbidden"),
-			expected: false,
-		},
-		{
-			name:     "not found 404",
-			err:      errors.New("404 not found"),
-			expected: false,
-		},
-		{
-			name:     "bad request 400",
-			err:      errors.New("400 bad request"),
-			expected: false,
-		},
-		{
-			name:     "api key error",
-			err:      errors.New("invalid api key"),
-			expected: false,
-		},
-		{
-			name:     "authentication error",
-			err:      errors.New("authentication failed"),
-			expected: false,
-		},
-		{
-			name:     "unknown error",
-			err:      errors.New("something weird happened"),
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			result := isRetryableModelError(tt.err)
-			assert.Equal(t, tt.expected, result, "isRetryableModelError(%v)", tt.err)
-		})
-	}
-}
-
-func TestCalculateBackoff(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		attempt     int
-		minExpected time.Duration
-		maxExpected time.Duration
-	}{
-		{attempt: 0, minExpected: 180 * time.Millisecond, maxExpected: 220 * time.Millisecond},
-		{attempt: 1, minExpected: 360 * time.Millisecond, maxExpected: 440 * time.Millisecond},
-		{attempt: 2, minExpected: 720 * time.Millisecond, maxExpected: 880 * time.Millisecond},
-		{attempt: 3, minExpected: 1440 * time.Millisecond, maxExpected: 1760 * time.Millisecond},
-		{attempt: 10, minExpected: 1800 * time.Millisecond, maxExpected: 2200 * time.Millisecond}, // should be capped at 2s
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("attempt_%d", tt.attempt), func(t *testing.T) {
-			t.Parallel()
-			backoff := calculateBackoff(tt.attempt)
-			assert.GreaterOrEqual(t, backoff, tt.minExpected, "backoff should be at least %v", tt.minExpected)
-			assert.LessOrEqual(t, backoff, tt.maxExpected, "backoff should be at most %v", tt.maxExpected)
-		})
-	}
-}
-
-func TestCalculateBackoff_NegativeAttempt(t *testing.T) {
-	t.Parallel()
-	// Negative attempts should be treated as 0
-	backoff := calculateBackoff(-1)
-	assert.GreaterOrEqual(t, backoff, 180*time.Millisecond)
-	assert.LessOrEqual(t, backoff, 220*time.Millisecond)
-}
-
-func TestSleepWithContext(t *testing.T) {
-	t.Parallel()
-
-	t.Run("completes normally", func(t *testing.T) {
-		t.Parallel()
-		ctx := t.Context()
-		start := time.Now()
-		completed := sleepWithContext(ctx, 10*time.Millisecond)
-		elapsed := time.Since(start)
-
-		assert.True(t, completed, "should complete normally")
-		assert.GreaterOrEqual(t, elapsed, 10*time.Millisecond)
-	})
-
-	t.Run("interrupted by context", func(t *testing.T) {
-		t.Parallel()
-		ctx, cancel := context.WithCancel(t.Context())
-
-		// Cancel context after a short delay
-		time.AfterFunc(10*time.Millisecond, cancel)
-
-		start := time.Now()
-		completed := sleepWithContext(ctx, 1*time.Second)
-		elapsed := time.Since(start)
-
-		assert.False(t, completed, "should be interrupted")
-		assert.Less(t, elapsed, 100*time.Millisecond, "should return quickly after cancel")
-	})
-}
+// Verify interface compliance
+var (
+	_ provider.Provider = (*mockProvider)(nil)
+	_ provider.Provider = (*failingProvider)(nil)
+	_ provider.Provider = (*countingProvider)(nil)
+)
 
 func TestBuildModelChain(t *testing.T) {
 	t.Parallel()
@@ -266,7 +72,7 @@ func TestBuildModelChain(t *testing.T) {
 		t.Parallel()
 		chain := buildModelChain(primary, nil)
 		require.Len(t, chain, 1)
-		assert.Equal(t, primary.ID(), chain[0].provider.ID())
+		assert.Equal(t, primary.ID().String(), chain[0].provider.ID().String())
 		assert.False(t, chain[0].isFallback)
 		assert.Equal(t, -1, chain[0].index)
 	})
@@ -276,14 +82,14 @@ func TestBuildModelChain(t *testing.T) {
 		chain := buildModelChain(primary, []provider.Provider{fallback1, fallback2})
 		require.Len(t, chain, 3)
 
-		assert.Equal(t, primary.ID(), chain[0].provider.ID())
+		assert.Equal(t, primary.ID().String(), chain[0].provider.ID().String())
 		assert.False(t, chain[0].isFallback)
 
-		assert.Equal(t, fallback1.ID(), chain[1].provider.ID())
+		assert.Equal(t, fallback1.ID().String(), chain[1].provider.ID().String())
 		assert.True(t, chain[1].isFallback)
 		assert.Equal(t, 0, chain[1].index)
 
-		assert.Equal(t, fallback2.ID(), chain[2].provider.ID())
+		assert.Equal(t, fallback2.ID().String(), chain[2].provider.ID().String())
 		assert.True(t, chain[2].isFallback)
 		assert.Equal(t, 1, chain[2].index)
 	})
@@ -291,11 +97,8 @@ func TestBuildModelChain(t *testing.T) {
 
 func TestFallbackOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Create providers that fail with retryable errors
 		primary := &failingProvider{id: "primary/failing", err: errors.New("500 internal server error")}
 		fallback1 := &failingProvider{id: "fallback1/failing", err: errors.New("503 service unavailable")}
-
-		// Fallback2 succeeds
 		successStream := newStreamBuilder().
 			AddContent("Success from fallback2").
 			AddStopWithUsage(10, 5).
@@ -306,7 +109,7 @@ func TestFallbackOrder(t *testing.T) {
 			agent.WithModel(primary),
 			agent.WithFallbackModel(fallback1),
 			agent.WithFallbackModel(fallback2),
-			agent.WithFallbackRetries(0), // No retries, just try each once
+			agent.WithFallbackRetries(0),
 		)
 
 		tm := team.New(team.WithAgents(root))
@@ -316,27 +119,19 @@ func TestFallbackOrder(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "Fallback Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
 		var gotContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Success from fallback2" {
-					gotContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success from fallback2" {
+				gotContent = true
 			}
 		}
-
 		assert.True(t, gotContent, "should receive content from fallback2")
 	})
 }
 
 func TestFallbackNoRetryOnNonRetryableError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary fails with non-retryable error (401)
 		primary := &failingProvider{id: "primary/auth-fail", err: errors.New("401 unauthorized")}
-
-		// Fallback that would succeed if tried
 		successStream := newStreamBuilder().
 			AddContent("Should not see this").
 			AddStopWithUsage(10, 5).
@@ -355,50 +150,35 @@ func TestFallbackNoRetryOnNonRetryableError(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "Non-Retryable Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
-		var gotError bool
-		var gotFallbackContent bool
-		for ev := range events {
+		var gotError, gotFallbackContent bool
+		for ev := range rt.RunStream(t.Context(), sess) {
 			if _, ok := ev.(*ErrorEvent); ok {
 				gotError = true
 			}
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Should not see this" {
-					gotFallbackContent = true
-				}
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Should not see this" {
+				gotFallbackContent = true
 			}
 		}
-
-		// Non-retryable error on primary should still try fallbacks
-		// The 401 should NOT be retried on the primary, but fallbacks can still be tried
-		// Actually per the code, non-retryable errors break out of the current model's retry loop
-		// and move to the next model in the chain
 		assert.True(t, gotFallbackContent || gotError, "should either get fallback content or error")
 	})
 }
 
 func TestFallbackRetriesWithBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary always fails
 		primary := &failingProvider{id: "primary/failing", err: errors.New("500 internal server error")}
-
-		// Fallback fails twice, then succeeds
 		successStream := newStreamBuilder().
 			AddContent("Success after retries").
 			AddStopWithUsage(10, 5).
 			Build()
 		fallback := &countingProvider{
-			id:        "fallback/counting",
-			failCount: 2,
-			err:       errors.New("503 service unavailable"),
-			stream:    successStream,
+			id: "fallback/counting", failCount: 2,
+			err: errors.New("503 service unavailable"), stream: successStream,
 		}
 
 		root := agent.New("root", "test",
 			agent.WithModel(primary),
 			agent.WithFallbackModel(fallback),
-			agent.WithFallbackRetries(3), // Allow 3 retries per fallback
+			agent.WithFallbackRetries(3),
 		)
 
 		tm := team.New(team.WithAgents(root))
@@ -408,17 +188,12 @@ func TestFallbackRetriesWithBackoff(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "Retry Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
 		var gotContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Success after retries" {
-					gotContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success after retries" {
+				gotContent = true
 			}
 		}
-
 		assert.True(t, gotContent, "should receive content after retries")
 		assert.Equal(t, 3, fallback.callCount, "fallback should be called 3 times (2 failures + 1 success)")
 	})
@@ -426,32 +201,24 @@ func TestFallbackRetriesWithBackoff(t *testing.T) {
 
 func TestPrimaryRetriesWithBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary fails twice with retryable error, then succeeds
 		successStream := newStreamBuilder().
 			AddContent("Primary success after retries").
 			AddStopWithUsage(10, 5).
 			Build()
 		primary := &countingProvider{
-			id:        "primary/counting",
-			failCount: 2,
-			err:       errors.New("503 service unavailable"),
-			stream:    successStream,
+			id: "primary/counting", failCount: 2,
+			err: errors.New("503 service unavailable"), stream: successStream,
 		}
-
-		// Fallback should NOT be called since primary succeeds on retry
 		fallback := &countingProvider{
-			id:        "fallback/should-not-be-called",
-			failCount: 0,
+			id: "fallback/should-not-be-called",
 			stream: newStreamBuilder().
-				AddContent("Fallback").
-				AddStopWithUsage(5, 2).
-				Build(),
+				AddContent("Fallback").AddStopWithUsage(5, 2).Build(),
 		}
 
 		root := agent.New("root", "test",
 			agent.WithModel(primary),
 			agent.WithFallbackModel(fallback),
-			agent.WithFallbackRetries(3), // Allow 3 retries per model
+			agent.WithFallbackRetries(3),
 		)
 
 		tm := team.New(team.WithAgents(root))
@@ -461,17 +228,12 @@ func TestPrimaryRetriesWithBackoff(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "Primary Retry Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
 		var gotPrimaryContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Primary success after retries" {
-					gotPrimaryContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Primary success after retries" {
+				gotPrimaryContent = true
 			}
 		}
-
 		assert.True(t, gotPrimaryContent, "should receive content from primary after retries")
 		assert.Equal(t, 3, primary.callCount, "primary should be called 3 times (2 failures + 1 success)")
 		assert.Equal(t, 0, fallback.callCount, "fallback should not be called when primary succeeds on retry")
@@ -480,22 +242,15 @@ func TestPrimaryRetriesWithBackoff(t *testing.T) {
 
 func TestNoFallbackWhenPrimarySucceeds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary succeeds
 		primaryStream := newStreamBuilder().
 			AddContent("Primary success").
 			AddStopWithUsage(10, 5).
 			Build()
 		primary := &mockProvider{id: "primary/success", stream: primaryStream}
-
-		// Track if fallback is called
-		fallbackCalled := false
 		fallback := &countingProvider{
-			id:        "fallback/should-not-be-called",
-			failCount: 0,
+			id: "fallback/should-not-be-called",
 			stream: newStreamBuilder().
-				AddContent("Fallback").
-				AddStopWithUsage(5, 2).
-				Build(),
+				AddContent("Fallback").AddStopWithUsage(5, 2).Build(),
 		}
 
 		root := agent.New("root", "test",
@@ -510,10 +265,8 @@ func TestNoFallbackWhenPrimarySucceeds(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "Primary Success Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
-		var gotPrimaryContent bool
-		for ev := range events {
+		var gotPrimaryContent, fallbackCalled bool
+		for ev := range rt.RunStream(t.Context(), sess) {
 			if choice, ok := ev.(*AgentChoiceEvent); ok {
 				if choice.Content == "Primary success" {
 					gotPrimaryContent = true
@@ -523,102 +276,18 @@ func TestNoFallbackWhenPrimarySucceeds(t *testing.T) {
 				}
 			}
 		}
-
 		assert.True(t, gotPrimaryContent, "should receive primary content")
 		assert.False(t, fallbackCalled, "fallback should not be called")
 		assert.Equal(t, 0, fallback.callCount, "fallback provider should not be invoked")
 	})
 }
 
-func TestExtractHTTPStatusCode(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		err      error
-		expected int
-	}{
-		{
-			name:     "nil error",
-			err:      nil,
-			expected: 0,
-		},
-		{
-			name:     "429 in message",
-			err:      errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
-			expected: 429,
-		},
-		{
-			name:     "500 in message",
-			err:      errors.New("internal server error 500"),
-			expected: 500,
-		},
-		{
-			name:     "502 in message",
-			err:      errors.New("502 bad gateway"),
-			expected: 502,
-		},
-		{
-			name:     "401 in message",
-			err:      errors.New("401 unauthorized"),
-			expected: 401,
-		},
-		{
-			name:     "no status code",
-			err:      errors.New("connection refused"),
-			expected: 0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			result := extractHTTPStatusCode(tt.err)
-			assert.Equal(t, tt.expected, result, "extractHTTPStatusCode(%v)", tt.err)
-		})
-	}
-}
-
-func TestIsRetryableStatusCode(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		statusCode int
-		expected   bool
-	}{
-		{500, true},  // Internal server error - retryable
-		{502, true},  // Bad gateway - retryable
-		{503, true},  // Service unavailable - retryable
-		{504, true},  // Gateway timeout - retryable
-		{408, true},  // Request timeout - retryable
-		{429, false}, // Rate limit - NOT retryable (skip to next model)
-		{400, false}, // Bad request - not retryable
-		{401, false}, // Unauthorized - not retryable
-		{403, false}, // Forbidden - not retryable
-		{404, false}, // Not found - not retryable
-		{200, false}, // Success codes - not retryable (but shouldn't happen)
-		{0, false},   // Unknown - not retryable
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("status_%d", tt.statusCode), func(t *testing.T) {
-			t.Parallel()
-			result := isRetryableStatusCode(tt.statusCode)
-			assert.Equal(t, tt.expected, result, "isRetryableStatusCode(%d)", tt.statusCode)
-		})
-	}
-}
-
 func TestFallback429SkipsToNextModel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary fails with 429 (rate limit) - should NOT be retried, skip to fallback immediately
 		primary := &countingProvider{
-			id:        "primary/rate-limited",
-			failCount: 100, // Always fails
-			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+			id: "primary/rate-limited", failCount: 100,
+			err: errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
 		}
-
-		// Fallback succeeds
 		successStream := newStreamBuilder().
 			AddContent("Success from fallback").
 			AddStopWithUsage(10, 5).
@@ -628,7 +297,7 @@ func TestFallback429SkipsToNextModel(t *testing.T) {
 		root := agent.New("root", "test",
 			agent.WithModel(primary),
 			agent.WithFallbackModel(fallback),
-			agent.WithFallbackRetries(5), // Even with retries, 429 should skip immediately
+			agent.WithFallbackRetries(5),
 		)
 
 		tm := team.New(team.WithAgents(root))
@@ -638,26 +307,19 @@ func TestFallback429SkipsToNextModel(t *testing.T) {
 		sess := session.New(session.WithUserMessage("test"))
 		sess.Title = "429 Skip Test"
 
-		events := rt.RunStream(t.Context(), sess)
-
 		var gotContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Success from fallback" {
-					gotContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success from fallback" {
+				gotContent = true
 			}
 		}
-
 		assert.True(t, gotContent, "should receive content from fallback")
-		// Primary should only be called once (no retries for 429)
 		assert.Equal(t, 1, primary.callCount, "primary should only be called once (429 is not retryable)")
 	})
 }
 
 func TestFallbackCooldownState(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Create a mock provider for the agent
 		mockModel := &mockProvider{id: "test/model", stream: newStreamBuilder().AddContent("ok").AddStopWithUsage(1, 1).Build()}
 		tm := team.New(team.WithAgents(
 			agent.New("test-agent", "test instruction", agent.WithModel(mockModel)),
@@ -668,49 +330,35 @@ func TestFallbackCooldownState(t *testing.T) {
 		agentName := "test-agent"
 
 		// Initially no cooldown
-		state := rt.getCooldownState(agentName)
-		assert.Nil(t, state, "should have no cooldown initially")
+		assert.Nil(t, rt.fallback.cooldowns.Get(agentName), "should have no cooldown initially")
 
 		// Set cooldown with short duration for testing
-		rt.setCooldownState(agentName, 0, 100*time.Millisecond)
-
-		// Should be in cooldown
-		state = rt.getCooldownState(agentName)
+		rt.fallback.cooldowns.Set(agentName, 0, 100*time.Millisecond)
+		state := rt.fallback.cooldowns.Get(agentName)
 		require.NotNil(t, state, "should have cooldown state")
 		assert.Equal(t, 0, state.fallbackIndex)
 
 		// Advance fake time past the cooldown
 		time.Sleep(101 * time.Millisecond)
-
-		// Cooldown should have expired
-		state = rt.getCooldownState(agentName)
-		assert.Nil(t, state, "cooldown should have expired")
+		assert.Nil(t, rt.fallback.cooldowns.Get(agentName), "cooldown should have expired")
 
 		// Set cooldown again and then clear it
-		rt.setCooldownState(agentName, 1, 1*time.Hour)
-		state = rt.getCooldownState(agentName)
-		require.NotNil(t, state)
+		rt.fallback.cooldowns.Set(agentName, 1, 1*time.Hour)
+		require.NotNil(t, rt.fallback.cooldowns.Get(agentName))
 
-		rt.clearCooldownState(agentName)
-		state = rt.getCooldownState(agentName)
-		assert.Nil(t, state, "cooldown should be cleared")
+		rt.fallback.cooldowns.Clear(agentName)
+		assert.Nil(t, rt.fallback.cooldowns.Get(agentName), "cooldown should be cleared")
 	})
 }
 
 func TestGetEffectiveCooldown(t *testing.T) {
 	t.Parallel()
 
-	// Agent with no cooldown configured should use default
 	agentNoConfig := agent.New("no-config", "test")
-	cooldown := getEffectiveCooldown(agentNoConfig)
-	assert.Equal(t, DefaultFallbackCooldown, cooldown, "should use default cooldown")
+	assert.Equal(t, modelerrors.DefaultCooldown, getEffectiveCooldown(agentNoConfig), "should use default cooldown")
 
-	// Agent with explicit cooldown should use that
-	agentWithConfig := agent.New("with-config", "test",
-		agent.WithFallbackCooldown(5*time.Minute),
-	)
-	cooldown = getEffectiveCooldown(agentWithConfig)
-	assert.Equal(t, 5*time.Minute, cooldown, "should use configured cooldown")
+	agentWithConfig := agent.New("with-config", "test", agent.WithFallbackCooldown(5*time.Minute))
+	assert.Equal(t, 5*time.Minute, getEffectiveCooldown(agentWithConfig), "should use configured cooldown")
 }
 
 func TestGetEffectiveRetries(t *testing.T) {
@@ -719,168 +367,277 @@ func TestGetEffectiveRetries(t *testing.T) {
 	mockModel := &mockProvider{id: "test/model", stream: newStreamBuilder().AddContent("ok").AddStopWithUsage(1, 1).Build()}
 	mockFallback := &mockProvider{id: "test/fallback", stream: newStreamBuilder().AddContent("ok").AddStopWithUsage(1, 1).Build()}
 
-	// Agent with no retries configured and no fallback models should return 0
-	agentNoFallback := agent.New("no-fallback", "test",
-		agent.WithModel(mockModel),
-	)
-	retries := getEffectiveRetries(agentNoFallback)
-	assert.Equal(t, 0, retries, "no fallback models = no retries (nothing to retry to)")
+	agentNoFallback := agent.New("no-fallback", "test", agent.WithModel(mockModel))
+	assert.Equal(t, modelerrors.DefaultRetries, getEffectiveRetries(agentNoFallback), "should use default retries even without fallback models")
 
-	// Agent with no retries configured but with fallback models should use default
-	agentWithFallback := agent.New("with-fallback", "test",
-		agent.WithModel(mockModel),
-		agent.WithFallbackModel(mockFallback),
-	)
-	retries = getEffectiveRetries(agentWithFallback)
-	assert.Equal(t, DefaultFallbackRetries, retries, "should use default retries when fallback models configured")
+	agentWithFallback := agent.New("with-fallback", "test", agent.WithModel(mockModel), agent.WithFallbackModel(mockFallback))
+	assert.Equal(t, modelerrors.DefaultRetries, getEffectiveRetries(agentWithFallback), "should use default retries when fallback models configured")
 
-	// Agent with explicit retries should use that value
-	agentExplicitRetries := agent.New("explicit-retries", "test",
-		agent.WithModel(mockModel),
-		agent.WithFallbackModel(mockFallback),
-		agent.WithFallbackRetries(5),
-	)
-	retries = getEffectiveRetries(agentExplicitRetries)
-	assert.Equal(t, 5, retries, "should use configured retries")
+	agentExplicitRetries := agent.New("explicit-retries", "test", agent.WithModel(mockModel), agent.WithFallbackModel(mockFallback), agent.WithFallbackRetries(5))
+	assert.Equal(t, 5, getEffectiveRetries(agentExplicitRetries), "should use configured retries")
 
-	// Agent with retries=-1 (explicitly no retries) should return 0
-	agentNoRetries := agent.New("no-retries", "test",
-		agent.WithModel(mockModel),
-		agent.WithFallbackModel(mockFallback),
-		agent.WithFallbackRetries(-1),
-	)
-	retries = getEffectiveRetries(agentNoRetries)
-	assert.Equal(t, 0, retries, "retries=-1 should return 0 (no retries)")
+	agentNoRetries := agent.New("no-retries", "test", agent.WithModel(mockModel), agent.WithFallbackModel(mockFallback), agent.WithFallbackRetries(-1))
+	assert.Equal(t, 0, getEffectiveRetries(agentNoRetries), "retries=-1 should return 0 (no retries)")
 }
 
-// trackingConfigProvider tracks how many times BaseConfig() is called.
-// This is used to verify that fallback providers are cloned (via CloneWithOptions)
-// which calls BaseConfig() to get the config to clone from.
-type trackingConfigProvider struct {
-	id              string
-	stream          chat.MessageStream
-	baseConfigCalls int
-}
-
-func (p *trackingConfigProvider) ID() string { return p.id }
-func (p *trackingConfigProvider) CreateChatCompletionStream(context.Context, []chat.Message, []tools.Tool) (chat.MessageStream, error) {
-	return p.stream, nil
-}
-
-func (p *trackingConfigProvider) BaseConfig() base.Config {
-	p.baseConfigCalls++
-	return base.Config{}
-}
-
-// TestFallbackModelsAreClonedWithThinkingOverride verifies that fallback models
-// receive the same thinking override as the primary model. This is a regression test
-// for a bug where fallback models bypassed the session thinking toggle, causing
-// provider default thinking to be unexpectedly enabled when fallbacks were used.
-func TestFallbackModelsAreClonedWithThinkingOverride(t *testing.T) {
+func TestFallback429WithFallbacksSkipsToNextModel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary fails immediately with non-retryable error to trigger fallback
-		primary := &failingProvider{id: "primary/fail", err: errors.New("401 unauthorized")}
-
-		// Fallback with tracking - CloneWithOptions calls BaseConfig() on the provider
-		fallbackStream := newStreamBuilder().
-			AddContent("Success from cloned fallback").
+		// Primary gets rate limited; with fallbacks configured it should skip immediately.
+		primary := &countingProvider{
+			id:        "primary/rate-limited",
+			failCount: 100,
+			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+		}
+		successStream := newStreamBuilder().
+			AddContent("Success from fallback").
 			AddStopWithUsage(10, 5).
 			Build()
-		fallback := &trackingConfigProvider{
-			id:     "fallback/tracked",
-			stream: fallbackStream,
-		}
+		fallback := &mockProvider{id: "fallback/success", stream: successStream}
 
 		root := agent.New("root", "test",
 			agent.WithModel(primary),
 			agent.WithFallbackModel(fallback),
-			agent.WithFallbackRetries(0), // No retries, just try each once
+			agent.WithFallbackRetries(5), // many retries — 429 should NOT use them
 		)
 
 		tm := team.New(team.WithAgents(root))
 		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}))
 		require.NoError(t, err)
 
-		// Create session with thinking disabled (default)
 		sess := session.New(session.WithUserMessage("test"))
-		sess.Title = "Fallback Cloning Test"
-		sess.Thinking = false
-
-		events := rt.RunStream(t.Context(), sess)
+		sess.Title = "429 With Fallback Skip Test"
 
 		var gotContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Success from cloned fallback" {
-					gotContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success from fallback" {
+				gotContent = true
 			}
 		}
-
-		// Verify fallback was used (content received)
 		assert.True(t, gotContent, "should receive content from fallback")
-
-		// Verify BaseConfig() was called on the fallback provider.
-		// This proves CloneWithOptions was called to clone the fallback with
-		// the session thinking override.
-		assert.GreaterOrEqual(t, fallback.baseConfigCalls, 1,
-			"BaseConfig() should be called on fallback provider (proves cloning occurred)")
+		assert.Equal(t, 1, primary.callCount, "primary should only be called once — 429 with fallbacks should skip immediately")
 	})
 }
 
-// TestFallbackModelsClonedWithThinkingEnabled verifies fallbacks are cloned
-// when session thinking is enabled too.
-func TestFallbackModelsClonedWithThinkingEnabled(t *testing.T) {
+func TestFallback429WithoutFallbacksRetriesSameModel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Primary fails immediately with non-retryable error to trigger fallback
-		primary := &failingProvider{id: "primary/fail", err: errors.New("401 unauthorized")}
-
-		// Fallback with tracking
-		fallbackStream := newStreamBuilder().
-			AddContent("Success with thinking enabled").
+		// Primary gets rate limited; with no fallbacks configured it should retry
+		// when the opt-in is enabled.
+		successStream := newStreamBuilder().
+			AddContent("Success after rate limit").
 			AddStopWithUsage(10, 5).
 			Build()
-		fallback := &trackingConfigProvider{
-			id:     "fallback/tracked",
-			stream: fallbackStream,
+		primary := &countingProvider{
+			id:        "primary/rate-limited",
+			failCount: 2, // fail twice with 429, then succeed
+			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+			stream:    successStream,
 		}
 
 		root := agent.New("root", "test",
 			agent.WithModel(primary),
-			agent.WithFallbackModel(fallback),
-			agent.WithFallbackRetries(0),
+			// No fallback models configured
+			agent.WithFallbackRetries(3),
+		)
+
+		tm := team.New(team.WithAgents(root))
+		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}), WithRetryOnRateLimit())
+		require.NoError(t, err)
+
+		sess := session.New(session.WithUserMessage("test"))
+		sess.Title = "429 No Fallback Retry Test"
+
+		var gotContent bool
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success after rate limit" {
+				gotContent = true
+			}
+		}
+		assert.True(t, gotContent, "should receive content after rate limit retries")
+		assert.Equal(t, 3, primary.callCount, "primary should be called 3 times: 2 failures + 1 success")
+	})
+}
+
+func TestFallback429WithoutFallbacksExhaustsRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Primary always returns 429, no fallbacks, opt-in enabled — should fail after all retries.
+		primary := &failingProvider{
+			id:  "primary/always-rate-limited",
+			err: errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+		}
+
+		root := agent.New("root", "test",
+			agent.WithModel(primary),
+			// No fallback models
+			agent.WithFallbackRetries(2),
+		)
+
+		tm := team.New(team.WithAgents(root))
+		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}), WithRetryOnRateLimit())
+		require.NoError(t, err)
+
+		sess := session.New(session.WithUserMessage("test"))
+		sess.Title = "429 No Fallback Exhaust Test"
+
+		var gotError bool
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if _, ok := ev.(*ErrorEvent); ok {
+				gotError = true
+			}
+		}
+		assert.True(t, gotError, "should receive an error when all retries exhausted")
+	})
+}
+
+func TestFallback500RetryableWithBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Primary returns 500 (retryable), no fallbacks — should retry with backoff.
+		successStream := newStreamBuilder().
+			AddContent("Success after 500").
+			AddStopWithUsage(10, 5).
+			Build()
+		primary := &countingProvider{
+			id:        "primary/server-error",
+			failCount: 1,
+			err:       errors.New("500 internal server error"),
+			stream:    successStream,
+		}
+
+		root := agent.New("root", "test",
+			agent.WithModel(primary),
+			// No fallback models
+			agent.WithFallbackRetries(2),
 		)
 
 		tm := team.New(team.WithAgents(root))
 		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}))
 		require.NoError(t, err)
 
-		// Create session with thinking ENABLED
 		sess := session.New(session.WithUserMessage("test"))
-		sess.Title = "Fallback Cloning Test (Thinking Enabled)"
-		sess.Thinking = true
-
-		events := rt.RunStream(t.Context(), sess)
+		sess.Title = "500 Retry Test"
 
 		var gotContent bool
-		for ev := range events {
-			if choice, ok := ev.(*AgentChoiceEvent); ok {
-				if choice.Content == "Success with thinking enabled" {
-					gotContent = true
-				}
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success after 500" {
+				gotContent = true
 			}
 		}
-
-		assert.True(t, gotContent, "should receive content from fallback")
-		assert.GreaterOrEqual(t, fallback.baseConfigCalls, 1,
-			"BaseConfig() should be called on fallback provider when thinking is enabled")
+		assert.True(t, gotContent, "should receive content after 500 retry")
+		assert.Equal(t, 2, primary.callCount, "primary should be called twice: 1 failure + 1 success")
 	})
 }
 
-// Verify interface compliance
-var (
-	_ provider.Provider = (*mockProvider)(nil)
-	_ provider.Provider = (*failingProvider)(nil)
-	_ provider.Provider = (*countingProvider)(nil)
-	_ provider.Provider = (*trackingConfigProvider)(nil)
-)
+// --- WithRetryOnRateLimit gate tests ---
+
+func TestRateLimitGate_DisabledNoFallbacks_FailsImmediately(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// With retryOnRateLimit=false (default) and no fallbacks, a 429 should
+		// be treated as non-retryable and fail immediately without any retry.
+		primary := &countingProvider{
+			id:        "primary/rate-limited",
+			failCount: 100,
+			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+		}
+
+		root := agent.New("root", "test",
+			agent.WithModel(primary),
+			// No fallback models, no WithRetryOnRateLimit opt-in
+			agent.WithFallbackRetries(3),
+		)
+
+		tm := team.New(team.WithAgents(root))
+		// Note: WithRetryOnRateLimit() is NOT passed — default off
+		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}))
+		require.NoError(t, err)
+
+		sess := session.New(session.WithUserMessage("test"))
+		sess.Title = "429 Gate Disabled Test"
+
+		var gotError bool
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if _, ok := ev.(*ErrorEvent); ok {
+				gotError = true
+			}
+		}
+		assert.True(t, gotError, "should fail immediately with an error")
+		assert.Equal(t, 1, primary.callCount, "primary should only be called once — no retry without opt-in")
+	})
+}
+
+func TestRateLimitGate_EnabledNoFallbacks_RetriesSameModel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// With retryOnRateLimit=true and no fallbacks, a 429 should retry
+		// the same model until it succeeds or retries are exhausted.
+		successStream := newStreamBuilder().
+			AddContent("Success after rate limit").
+			AddStopWithUsage(10, 5).
+			Build()
+		primary := &countingProvider{
+			id:        "primary/rate-limited",
+			failCount: 2,
+			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+			stream:    successStream,
+		}
+
+		root := agent.New("root", "test",
+			agent.WithModel(primary),
+			// No fallback models
+			agent.WithFallbackRetries(3),
+		)
+
+		tm := team.New(team.WithAgents(root))
+		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}), WithRetryOnRateLimit())
+		require.NoError(t, err)
+
+		sess := session.New(session.WithUserMessage("test"))
+		sess.Title = "429 Gate Enabled No Fallbacks Test"
+
+		var gotContent bool
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success after rate limit" {
+				gotContent = true
+			}
+		}
+		assert.True(t, gotContent, "should receive content after retrying")
+		assert.Equal(t, 3, primary.callCount, "primary should be called 3 times: 2 failures + 1 success")
+	})
+}
+
+func TestRateLimitGate_EnabledWithFallbacks_SkipsToFallback(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Even with retryOnRateLimit=true, when fallbacks are configured
+		// a 429 should skip to the fallback immediately (fallbacks take priority).
+		primary := &countingProvider{
+			id:        "primary/rate-limited",
+			failCount: 100,
+			err:       errors.New("POST /v1/chat/completions: 429 Too Many Requests"),
+		}
+		successStream := newStreamBuilder().
+			AddContent("Success from fallback").
+			AddStopWithUsage(10, 5).
+			Build()
+		fallback := &mockProvider{id: "fallback/success", stream: successStream}
+
+		root := agent.New("root", "test",
+			agent.WithModel(primary),
+			agent.WithFallbackModel(fallback),
+			agent.WithFallbackRetries(5),
+		)
+
+		tm := team.New(team.WithAgents(root))
+		// opt-in is enabled, but fallbacks are present → should still skip to fallback
+		rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}), WithRetryOnRateLimit())
+		require.NoError(t, err)
+
+		sess := session.New(session.WithUserMessage("test"))
+		sess.Title = "429 Gate Enabled With Fallbacks Test"
+
+		var gotContent bool
+		for ev := range rt.RunStream(t.Context(), sess) {
+			if choice, ok := ev.(*AgentChoiceEvent); ok && choice.Content == "Success from fallback" {
+				gotContent = true
+			}
+		}
+		assert.True(t, gotContent, "should receive content from fallback")
+		assert.Equal(t, 1, primary.callCount, "primary should only be called once — fallbacks take priority over retry")
+	})
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,9 +14,9 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 
-	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/reference"
-	"github.com/docker/cagent/pkg/userconfig"
+	"github.com/docker/docker-agent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/reference"
+	"github.com/docker/docker-agent/pkg/userconfig"
 )
 
 //go:embed builtin-agents/default.yaml
@@ -104,7 +105,8 @@ func resolveOne(resolvedPath string, envProvider environment.Provider) (string, 
 	case builtinAgents[resolvedPath] != nil:
 		return resolvedPath, NewBytesSource(resolvedPath, builtinAgents[resolvedPath])
 	case IsURLReference(resolvedPath):
-		return resolvedPath, NewURLSource(resolvedPath, envProvider)
+		// URL-encode the URL to make it safe for use as a map key
+		return url.QueryEscape(resolvedPath), NewURLSource(resolvedPath, envProvider)
 	case isLocalFile(resolvedPath):
 		return fileNameWithoutExt(resolvedPath), NewFileSource(resolvedPath)
 	default:
@@ -125,7 +127,7 @@ func resolveDirectory(dirPath string, envProvider environment.Provider) (Sources
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
-		if ext != ".yaml" && ext != ".yml" {
+		if ext != ".yaml" && ext != ".yml" && ext != ".hcl" {
 			continue
 		}
 		a := filepath.Join(dirPath, entry.Name())
@@ -198,8 +200,8 @@ func IsOCIReference(input string) bool {
 // isLocalFile checks if the input is a local file
 func isLocalFile(input string) bool {
 	ext := strings.ToLower(filepath.Ext(input))
-	// Check for YAML file extensions or file descriptors
-	if ext == ".yaml" || ext == ".yml" || strings.HasPrefix(input, "/dev/fd/") {
+	// Check for known config file extensions or file descriptors
+	if ext == ".yaml" || ext == ".yml" || ext == ".hcl" || strings.HasPrefix(input, "/dev/fd/") {
 		return true
 	}
 	// Check if it exists as a file on disk
@@ -210,4 +212,89 @@ func fileNameWithoutExt(path string) string {
 	base := filepath.Base(path)
 	ext := filepath.Ext(base)
 	return strings.TrimSuffix(base, ext)
+}
+
+// IsExternalReference reports whether the input is an external agent reference
+// (OCI image or URL) rather than a local agent name defined in the same config.
+// Local agent names never contain "/", so the slash check distinguishes them
+// from OCI references like "agentcatalog/pirate" or "docker.io/org/agent:v1".
+// It also handles the "name:ref" syntax (e.g. "reviewer:agentcatalog/review-pr").
+func IsExternalReference(input string) bool {
+	_, ref := ParseExternalAgentRef(input)
+	return isExternalRef(ref)
+}
+
+// ParseExternalAgentRef parses an external agent reference that may include an
+// explicit name prefix. The syntax is "name:reference" where name is a simple
+// identifier (no slashes) and reference is an OCI reference or URL.
+//
+// If no explicit name is provided, the base name is derived from the reference:
+//   - OCI refs: last path segment without tag (e.g. "agentcatalog/review-pr" → "review-pr")
+//   - URLs: filename without extension (e.g. "https://example.com/agent.yaml" → "agent")
+//
+// Examples:
+//
+//	ParseExternalAgentRef("reviewer:agentcatalog/review-pr") → ("reviewer", "agentcatalog/review-pr")
+//	ParseExternalAgentRef("agentcatalog/review-pr") → ("review-pr", "agentcatalog/review-pr")
+//	ParseExternalAgentRef("docker.io/myorg/myagent:v1") → ("myagent", "docker.io/myorg/myagent:v1")
+//	ParseExternalAgentRef("https://example.com/agent.yaml") → ("agent", "https://example.com/agent.yaml")
+func ParseExternalAgentRef(input string) (agentName, ref string) {
+	// If the whole input is already a valid external reference, derive the name
+	// from it without trying to split on ":".
+	if isExternalRef(input) {
+		return externalRefBaseName(input), input
+	}
+
+	// Check for explicit "name:reference" syntax.
+	// A name prefix is identified by not containing "/" (distinguishing it from
+	// OCI references or URLs which always contain slashes).
+	if i := strings.Index(input, ":"); i > 0 {
+		candidate := input[:i]
+		if !strings.Contains(candidate, "/") {
+			remainder := input[i+1:]
+			if isExternalRef(remainder) {
+				return candidate, remainder
+			}
+		}
+	}
+
+	// Fallback: return input as both name and ref (for local agent names).
+	return input, input
+}
+
+// isExternalRef is the core check for whether a string is an external reference.
+// It is used by both IsExternalReference and ParseExternalAgentRef to avoid
+// circular dependencies.
+func isExternalRef(input string) bool {
+	return IsURLReference(input) || (strings.Contains(input, "/") && IsOCIReference(input))
+}
+
+// externalRefBaseName extracts a short agent name from an external reference.
+//
+//   - OCI: last path segment, tag/digest stripped
+//     "agentcatalog/review-pr" → "review-pr"
+//     "docker.io/myorg/myagent:v1" → "myagent"
+//
+//   - URL: filename without extension
+//     "https://example.com/agent.yaml" → "agent"
+func externalRefBaseName(ref string) string {
+	if IsURLReference(ref) {
+		return fileNameWithoutExt(ref)
+	}
+
+	// OCI reference: strip tag or digest, then take last path segment.
+	base := ref
+	if i := strings.LastIndex(base, "@"); i >= 0 {
+		base = base[:i]
+	}
+	if i := strings.LastIndex(base, ":"); i >= 0 {
+		// Only strip if the colon is after the last slash (i.e. it's a tag, not a port).
+		if j := strings.LastIndex(base, "/"); j < i {
+			base = base[:i]
+		}
+	}
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	return base
 }

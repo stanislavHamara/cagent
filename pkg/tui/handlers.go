@@ -1,8 +1,8 @@
 package tui
 
 import (
-	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,22 +13,21 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/atotto/clipboard"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/browser"
-	"github.com/docker/cagent/pkg/evaluation"
-	"github.com/docker/cagent/pkg/modelsdev"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/tools"
-	mcptools "github.com/docker/cagent/pkg/tools/mcp"
-	"github.com/docker/cagent/pkg/tui/components/markdown"
-	"github.com/docker/cagent/pkg/tui/components/notification"
-	"github.com/docker/cagent/pkg/tui/components/tool/editfile"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/dialog"
-	"github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/page/chat"
-	"github.com/docker/cagent/pkg/tui/styles"
-	"github.com/docker/cagent/pkg/userconfig"
+	"github.com/docker/docker-agent/pkg/app"
+	"github.com/docker/docker-agent/pkg/browser"
+	"github.com/docker/docker-agent/pkg/evaluation"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/shellpath"
+	"github.com/docker/docker-agent/pkg/tools"
+	mcptools "github.com/docker/docker-agent/pkg/tools/mcp"
+	"github.com/docker/docker-agent/pkg/tui/components/markdown"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/tool/editfile"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/dialog"
+	"github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/userconfig"
 )
 
 // --- Session management ---
@@ -72,7 +71,7 @@ func (m *appModel) handleBranchFromEdit(msg messages.BranchFromEditMsg) (tea.Mod
 	if m.tuiStore != nil {
 		oldPersistedID := m.persistedSessionID(activeID)
 		if err := m.tuiStore.UpdateTabSessionID(ctx, oldPersistedID, newSess.ID); err != nil {
-			slog.Warn("Failed to update tab session ID after branch", "error", err)
+			slog.WarnContext(ctx, "Failed to update tab session ID after branch", "error", err)
 		}
 	}
 	m.persistActiveTab(newSess.ID)
@@ -96,6 +95,51 @@ func (m *appModel) handleBranchFromEdit(msg messages.BranchFromEditMsg) (tea.Mod
 			Attachments: msg.Attachments,
 		}),
 	)
+}
+
+func (m *appModel) handleForkSession() (tea.Model, tea.Cmd) {
+	currentSession := m.application.Session()
+	if currentSession == nil {
+		return m, notification.ErrorCmd("No active session to fork")
+	}
+
+	store := m.application.SessionStore()
+	if store == nil {
+		return m, notification.ErrorCmd("No session store configured")
+	}
+
+	spawner := m.supervisor.Spawner()
+	if spawner == nil {
+		return m, notification.ErrorCmd("Session spawning not available")
+	}
+
+	ctx := context.Background()
+
+	// Fork the session and clone all messages.
+	forkedSession, err := session.BranchSession(currentSession, len(currentSession.Messages))
+	if err != nil {
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to fork session: %v", err))
+	}
+
+	if err := store.AddSession(ctx, forkedSession); err != nil {
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to save forked session: %v", err))
+	}
+
+	a, _, cleanup, err := spawner(ctx, forkedSession.WorkingDir)
+	if err != nil {
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to create runtime for fork: %v", err))
+	}
+
+	a.ReplaceSession(ctx, forkedSession)
+	m.supervisor.AddSession(ctx, a, forkedSession, forkedSession.WorkingDir, cleanup)
+
+	if m.tuiStore != nil {
+		if err := m.tuiStore.AddTab(ctx, forkedSession.ID, forkedSession.WorkingDir); err != nil {
+			slog.WarnContext(ctx, "Failed to persist forked tab", "error", err)
+		}
+	}
+
+	return m.handleSwitchTab(forkedSession.ID)
 }
 
 func (m *appModel) handleToggleSessionStar(sessionID string) (tea.Model, tea.Cmd) {
@@ -125,12 +169,12 @@ func (m *appModel) handleToggleSessionStar(sessionID string) (tea.Model, tea.Cmd
 
 func (m *appModel) handleSetSessionTitle(title string) (tea.Model, tea.Cmd) {
 	if err := m.application.UpdateSessionTitle(context.Background(), title); err != nil {
-		if isErrTitleGenerating(err) {
+		if errors.Is(err, app.ErrTitleGenerating) {
 			return m, notification.WarningCmd("Title is being generated, please wait")
 		}
 		return m, notification.ErrorCmd(fmt.Sprintf("Failed to set session title: %v", err))
 	}
-	return m, notification.SuccessCmd(fmt.Sprintf("Title set to: %s", title))
+	return m, notification.SuccessCmd("Title set to: " + title)
 }
 
 func (m *appModel) handleRegenerateTitle() (tea.Model, tea.Cmd) {
@@ -142,7 +186,7 @@ func (m *appModel) handleRegenerateTitle() (tea.Model, tea.Cmd) {
 		return m, notification.ErrorCmd("Cannot regenerate title: no user message in session")
 	}
 	if err := m.application.RegenerateSessionTitle(context.Background()); err != nil {
-		if isErrTitleGenerating(err) {
+		if errors.Is(err, app.ErrTitleGenerating) {
 			return m, notification.WarningCmd("Title is being generated, please wait")
 		}
 		return m, notification.ErrorCmd(fmt.Sprintf("Failed to regenerate title: %v", err))
@@ -151,15 +195,24 @@ func (m *appModel) handleRegenerateTitle() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(spinnerCmd, notification.SuccessCmd("Regenerating title..."))
 }
 
-func isErrTitleGenerating(err error) bool {
-	return err != nil && err.Error() == app.ErrTitleGenerating.Error()
+func (m *appModel) handleDeleteSession(sessionID string) (tea.Model, tea.Cmd) {
+	store := m.application.SessionStore()
+	if store == nil {
+		return m, notification.ErrorCmd("No session store configured")
+	}
+
+	if err := store.DeleteSession(context.Background(), sessionID); err != nil {
+		return m, notification.ErrorCmd("Failed to delete session: " + err.Error())
+	}
+
+	return m, notification.SuccessCmd("Session deleted.")
 }
 
 // --- Eval / Export / Compact / Copy ---
 
 func (m *appModel) handleEvalSession(filename string) (tea.Model, tea.Cmd) {
 	evalFile, _ := evaluation.Save(m.application.Session(), filename)
-	return m, notification.SuccessCmd(fmt.Sprintf("Eval saved to file %s", evalFile))
+	return m, notification.SuccessCmd("Eval saved to file " + evalFile)
 }
 
 func (m *appModel) handleExportSession(filename string) (tea.Model, tea.Cmd) {
@@ -167,7 +220,7 @@ func (m *appModel) handleExportSession(filename string) (tea.Model, tea.Cmd) {
 	if err != nil {
 		return m, notification.ErrorCmd(fmt.Sprintf("Failed to export session: %v", err))
 	}
-	return m, notification.SuccessCmd(fmt.Sprintf("Session exported to %s", exportFile))
+	return m, notification.SuccessCmd("Session exported to " + exportFile)
 }
 
 func (m *appModel) handleCompactSession(additionalPrompt string) (tea.Model, tea.Cmd) {
@@ -179,14 +232,7 @@ func (m *appModel) handleCopySessionToClipboard() (tea.Model, tea.Cmd) {
 	if transcript == "" {
 		return m, notification.SuccessCmd("Conversation is empty; nothing copied.")
 	}
-	return m, tea.Sequence(
-		tea.SetClipboard(transcript),
-		func() tea.Msg {
-			_ = clipboard.WriteAll(transcript)
-			return nil
-		},
-		notification.SuccessCmd("Conversation copied to clipboard."),
-	)
+	return m, copyToClipboard(transcript, "Conversation copied to clipboard.")
 }
 
 func (m *appModel) handleCopyLastResponseToClipboard() (tea.Model, tea.Cmd) {
@@ -198,13 +244,70 @@ func (m *appModel) handleCopyLastResponseToClipboard() (tea.Model, tea.Cmd) {
 	if lastResponse == "" {
 		return m, notification.InfoCmd("No assistant response to copy.")
 	}
-	return m, tea.Sequence(
-		tea.SetClipboard(lastResponse),
+	return m, copyToClipboard(lastResponse, "Last response copied to clipboard.")
+}
+
+func (m *appModel) handleUndoSnapshot() (tea.Model, tea.Cmd) {
+	if m.chatPage.IsWorking() {
+		return m, notification.WarningCmd("Wait for the current response to finish before undoing")
+	}
+	result, err := m.application.UndoLastSnapshot(context.Background())
+	if err != nil {
+		if errors.Is(err, app.ErrNothingToUndo) {
+			return m, notification.InfoCmd("No snapshot to undo")
+		}
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to undo snapshot: %v", err))
+	}
+
+	text := fmt.Sprintf("Restored %d file%s from the last snapshot", result.RestoredFiles, plural(result.RestoredFiles))
+	return m, notification.SuccessCmd(text)
+}
+
+func (m *appModel) handleShowSnapshotsDialog() (tea.Model, tea.Cmd) {
+	snapshots := m.application.ListSnapshots()
+	return m, core.CmdHandler(dialog.OpenDialogMsg{
+		Model: dialog.NewSnapshotsDialog(snapshots),
+	})
+}
+
+func (m *appModel) handleResetSnapshot(keep int) (tea.Model, tea.Cmd) {
+	if m.chatPage.IsWorking() {
+		return m, notification.WarningCmd("Wait for the current response to finish before resetting")
+	}
+	result, err := m.application.ResetSnapshot(context.Background(), keep)
+	if err != nil {
+		if errors.Is(err, app.ErrNothingToUndo) {
+			return m, notification.InfoCmd("Nothing to reset")
+		}
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to reset snapshot: %v", err))
+	}
+
+	target := "the original state"
+	if keep > 0 {
+		target = fmt.Sprintf("snapshot %d", keep)
+	}
+	text := fmt.Sprintf("Restored %d file%s to %s", result.RestoredFiles, plural(result.RestoredFiles), target)
+	return m, notification.SuccessCmd(text)
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// copyToClipboard returns a sequenced command that copies text to the system
+// clipboard using both the OSC 52 escape sequence (for SSH/tmux compatibility)
+// and the platform-native clipboard API, then shows a success notification.
+func copyToClipboard(text, successMsg string) tea.Cmd {
+	return tea.Sequence(
+		tea.SetClipboard(text),
 		func() tea.Msg {
-			_ = clipboard.WriteAll(lastResponse)
+			_ = clipboard.WriteAll(text)
 			return nil
 		},
-		notification.SuccessCmd("Last response copied to clipboard."),
+		notification.SuccessCmd(successMsg),
 	)
 }
 
@@ -215,7 +318,10 @@ func (m *appModel) handleSwitchAgent(agentName string) (tea.Model, tea.Cmd) {
 		return m, notification.ErrorCmd(fmt.Sprintf("Failed to switch to agent '%s': %v", agentName, err))
 	}
 	m.sessionState.SetCurrentAgentName(agentName)
-	return m, notification.SuccessCmd(fmt.Sprintf("Switched to agent '%s'", agentName))
+	return m, tea.Batch(
+		m.updateChatCmd(messages.SessionToggleChangedMsg{}),
+		notification.SuccessCmd(fmt.Sprintf("Switched to agent '%s'", agentName)),
+	)
 }
 
 func (m *appModel) handleCycleAgent() (tea.Model, tea.Cmd) {
@@ -251,52 +357,26 @@ func (m *appModel) handleToggleYolo() (tea.Model, tea.Cmd) {
 	sess := m.application.Session()
 	sess.ToolsApproved = !sess.ToolsApproved
 	m.sessionState.SetYoloMode(sess.ToolsApproved)
-	updated, cmd := m.chatPage.Update(messages.SessionToggleChangedMsg{})
-	m.chatPage = updated.(chat.Page)
-	return m, cmd
+	return m.forwardChat(messages.SessionToggleChangedMsg{})
 }
 
-func (m *appModel) handleToggleThinking() (tea.Model, tea.Cmd) {
-	if m.cancelThinkingCheck != nil {
-		m.cancelThinkingCheck()
+// handleTogglePause toggles whether the runtime loop is paused at iteration
+// boundaries. The pause kicks in once the in-flight LLM request and its tool
+// calls finish; running /pause again resumes the loop.
+func (m *appModel) handleTogglePause() (tea.Model, tea.Cmd) {
+	paused, supported := m.application.TogglePause()
+	switch {
+	case !supported:
+		return m, notification.InfoCmd("Pause is not supported with remote runtimes")
+	case paused:
+		return m, notification.InfoCmd("Runtime paused — /pause again to resume")
+	default:
+		return m, notification.SuccessCmd("Runtime resumed")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancelThinkingCheck = cancel
-
-	currentModel := m.application.CurrentAgentModel()
-	return m, func() tea.Msg {
-		supported := modelsdev.ModelSupportsReasoning(ctx, currentModel)
-		return messages.ToggleThinkingResultMsg{Supported: supported}
-	}
-}
-
-func (m *appModel) handleToggleThinkingResult(msg messages.ToggleThinkingResultMsg) (tea.Model, tea.Cmd) {
-	if !msg.Supported {
-		return m, notification.InfoCmd("Thinking/reasoning is not supported for the current model")
-	}
-	sess := m.application.Session()
-	sess.Thinking = !sess.Thinking
-	m.sessionState.SetThinking(sess.Thinking)
-	if store := m.application.SessionStore(); store != nil {
-		if err := store.UpdateSession(context.Background(), sess); err != nil {
-			return m, notification.ErrorCmd(fmt.Sprintf("Failed to save session: %v", err))
-		}
-	}
-	var infoMsg string
-	if sess.Thinking {
-		infoMsg = "Thinking/reasoning enabled for this session"
-	} else {
-		infoMsg = "Thinking/reasoning disabled for this session"
-	}
-	updated, cmd := m.chatPage.Update(messages.SessionToggleChangedMsg{})
-	m.chatPage = updated.(chat.Page)
-	return m, tea.Batch(cmd, notification.InfoCmd(infoMsg))
 }
 
 func (m *appModel) handleToggleHideToolResults() (tea.Model, tea.Cmd) {
-	updated, cmd := m.chatPage.Update(messages.ToggleHideToolResultsMsg{})
-	m.chatPage = updated.(chat.Page)
-	return m, cmd
+	return m.forwardChat(messages.ToggleHideToolResultsMsg{})
 }
 
 func (m *appModel) handleToggleSplitDiff() (tea.Model, tea.Cmd) {
@@ -304,29 +384,30 @@ func (m *appModel) handleToggleSplitDiff() (tea.Model, tea.Cmd) {
 	enabled := m.sessionState.SplitDiffView()
 
 	// Persist to global userconfig
-	go func() {
-		cfg, err := userconfig.Load()
-		if err != nil {
-			slog.Warn("Failed to load userconfig for split diff toggle", "error", err)
-			return
-		}
-		if cfg.Settings == nil {
-			cfg.Settings = &userconfig.Settings{}
-		}
-		cfg.Settings.SplitDiffView = &enabled
-		if err := cfg.Save(); err != nil {
-			slog.Warn("Failed to persist split diff setting to userconfig", "error", err)
-		}
-	}()
+	go persistSplitDiffView(enabled)
 
-	var cmds []tea.Cmd
-	updated, cmd := m.chatPage.Update(editfile.ToggleDiffViewMsg{})
-	m.chatPage = updated.(chat.Page)
-	cmds = append(cmds, cmd)
-	updated, cmd = m.chatPage.Update(messages.SessionToggleChangedMsg{})
-	m.chatPage = updated.(chat.Page)
-	cmds = append(cmds, cmd)
-	return m, tea.Batch(cmds...)
+	return m, tea.Batch(
+		m.updateChatCmd(editfile.ToggleDiffViewMsg{}),
+		m.updateChatCmd(messages.SessionToggleChangedMsg{}),
+	)
+}
+
+// persistSplitDiffView writes the current split-diff toggle to the user
+// config without blocking the UI. Errors are logged but otherwise ignored
+// because losing the persistence is non-fatal.
+func persistSplitDiffView(enabled bool) {
+	cfg, err := userconfig.Load()
+	if err != nil {
+		slog.Warn("Failed to load userconfig for split diff toggle", "error", err)
+		return
+	}
+	if cfg.Settings == nil {
+		cfg.Settings = &userconfig.Settings{}
+	}
+	cfg.Settings.SplitDiffView = &enabled
+	if err := cfg.Save(); err != nil {
+		slog.Warn("Failed to persist split diff setting to userconfig", "error", err)
+	}
 }
 
 // --- Dialogs ---
@@ -345,6 +426,46 @@ func (m *appModel) handleShowPermissionsDialog() (tea.Model, tea.Cmd) {
 	return m, core.CmdHandler(dialog.OpenDialogMsg{
 		Model: dialog.NewPermissionsDialog(perms, yoloEnabled),
 	})
+}
+
+func (m *appModel) handleShowToolsDialog() (tea.Model, tea.Cmd) {
+	agentTools, err := m.application.CurrentAgentTools(context.Background())
+	if err != nil {
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to load tools: %v", err))
+	}
+	// Read toolset statuses *after* CurrentAgentTools so the snapshot
+	// reflects the same Started state the user just observed (Tools()
+	// drives lazy startup of any not-yet-started toolset).
+	statuses := m.application.CurrentAgentToolsetStatuses()
+	return m, core.CmdHandler(dialog.OpenDialogMsg{
+		Model: dialog.NewToolsDialog(statuses, agentTools),
+	})
+}
+
+// handleRestartToolset asks the runtime to restart the named toolset.
+// The actual call can block for up to ~35s (the supervisor's
+// reconnect timeout), so we run it inside a tea.Cmd goroutine and
+// surface the result via a notification toast on completion.
+func (m *appModel) handleRestartToolset(name string) (tea.Model, tea.Cmd) {
+	if name == "" {
+		return m, notification.ErrorCmd("usage: /toolset-restart <name>")
+	}
+	appRef := m.application
+	return m, tea.Batch(
+		notification.InfoCmd(fmt.Sprintf("Restarting toolset %q…", name)),
+		func() tea.Msg {
+			if err := appRef.RestartToolset(context.Background(), name); err != nil {
+				return notification.ShowMsg{
+					Text: fmt.Sprintf("Failed to restart %q: %v", name, err),
+					Type: notification.TypeError,
+				}
+			}
+			return notification.ShowMsg{
+				Text: fmt.Sprintf("Toolset %q restarted", name),
+				Type: notification.TypeSuccess,
+			}
+		},
+	)
 }
 
 // --- MCP prompts ---
@@ -389,7 +510,7 @@ func (m *appModel) handleChangeModel(modelRef string) (tea.Model, tea.Cmd) {
 	if modelRef == "" {
 		return m, notification.SuccessCmd("Model reset to default")
 	}
-	return m, notification.SuccessCmd(fmt.Sprintf("Model changed to %s", modelRef))
+	return m, notification.SuccessCmd("Model changed to " + modelRef)
 }
 
 // --- Theme picker ---
@@ -440,7 +561,7 @@ func (m *appModel) handleChangeTheme(themeRef string) (tea.Model, tea.Cmd) {
 		slog.Warn("Failed to save theme to user config", "theme", themeRef, "error", err)
 	}
 	return m, tea.Sequence(
-		notification.SuccessCmd(fmt.Sprintf("Theme changed to %s", theme.Name)),
+		notification.SuccessCmd("Theme changed to "+theme.Name),
 		core.CmdHandler(messages.ThemeChangedMsg{}),
 	)
 }
@@ -476,18 +597,10 @@ func (m *appModel) invalidateCachesForThemeChange() {
 
 func (m *appModel) applyThemeChanged() (tea.Model, tea.Cmd) {
 	m.invalidateCachesForThemeChange()
-
-	var cmds []tea.Cmd
-
-	dialogUpdated, dialogCmd := m.dialogMgr.Update(messages.ThemeChangedMsg{})
-	m.dialogMgr = dialogUpdated.(dialog.Manager)
-	cmds = append(cmds, dialogCmd)
-
-	chatUpdated, chatCmd := m.chatPage.Update(messages.ThemeChangedMsg{})
-	m.chatPage = chatUpdated.(chat.Page)
-	cmds = append(cmds, chatCmd)
-
-	return m, tea.Batch(cmds...)
+	return m, tea.Batch(
+		m.updateDialogCmd(messages.ThemeChangedMsg{}),
+		m.updateChatCmd(messages.ThemeChangedMsg{}),
+	)
 }
 
 // handleThemeFileChanged hot-reloads a theme that was modified on disk.
@@ -517,16 +630,86 @@ func (m *appModel) handleAgentCommand(command string) (tea.Model, tea.Cmd) {
 
 func (m *appModel) handleAttachFile(filePath string) (tea.Model, tea.Cmd) {
 	if filePath != "" {
-		info, err := os.Stat(filePath)
-		if err == nil && !info.IsDir() {
-			// Attach file to the editor directly
-			m.editor.AttachFile(filePath)
-			return m, notification.SuccessCmd("File attached: " + filePath)
+		if err := m.editor.AttachFile(filePath); err != nil {
+			slog.Warn("failed to attach file", "path", filePath, "error", err)
+			// Attachment failed — open the file picker with an error notification
+			return m, tea.Batch(
+				notification.ErrorCmd("Failed to attach "+filePath),
+				core.CmdHandler(dialog.OpenDialogMsg{
+					Model: dialog.NewFilePickerDialog(filePath),
+				}),
+			)
 		}
+		return m, notification.SuccessCmd("File attached: " + filePath)
 	}
+
+	// No path provided — open the file picker dialog
 	return m, core.CmdHandler(dialog.OpenDialogMsg{
 		Model: dialog.NewFilePickerDialog(filePath),
 	})
+}
+
+// --- Speech-to-text ---
+
+func (m *appModel) handleStartSpeak() (tea.Model, tea.Cmd) {
+	if m.transcriber.IsRunning() {
+		return m, nil
+	}
+
+	// Close any previous channel to unblock stale waitForTranscript goroutines.
+	m.closeTranscriptCh()
+
+	ch := make(chan string, 100)
+	m.transcriptCh = ch
+	err := m.transcriber.Start(context.Background(), func(delta string) {
+		select {
+		case ch <- delta:
+		default:
+		}
+	})
+	if err != nil {
+		m.closeTranscriptCh()
+		return m, notification.ErrorCmd(fmt.Sprintf("Failed to start listening: %v", err))
+	}
+
+	return m, tea.Batch(
+		notification.InfoCmd("🎤 Listening... (ENTER to send or ESC to cancel)"),
+		m.editor.SetRecording(true),
+		m.waitForTranscript(),
+	)
+}
+
+func (m *appModel) handleStopSpeak() (tea.Model, tea.Cmd) {
+	if !m.transcriber.IsRunning() {
+		return m, nil
+	}
+
+	m.transcriber.Stop()
+	m.closeTranscriptCh()
+
+	return m, tea.Batch(m.editor.SetRecording(false), notification.SuccessCmd("Stopped listening"))
+}
+
+// waitForTranscript returns a command that blocks until the next transcript
+// delta arrives and delivers it as a SpeakTranscriptMsg.
+func (m *appModel) waitForTranscript() tea.Cmd {
+	ch := m.transcriptCh
+	return func() tea.Msg {
+		delta, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return messages.SpeakTranscriptMsg{Delta: delta}
+	}
+}
+
+// closeTranscriptCh closes the transcript channel and sets it to nil,
+// unblocking any goroutines waiting in waitForTranscript.
+func (m *appModel) closeTranscriptCh() {
+	if m.transcriptCh != nil {
+		close(m.transcriptCh)
+		m.transcriptCh = nil
+	}
 }
 
 func (m *appModel) handleElicitationResponse(action tools.ElicitationAction, content map[string]any) (tea.Model, tea.Cmd) {
@@ -538,25 +721,35 @@ func (m *appModel) handleElicitationResponse(action tools.ElicitationAction, con
 }
 
 func (m *appModel) startShell() (tea.Model, tea.Cmd) {
-	var cmd *exec.Cmd
-	if goruntime.GOOS == "windows" {
-		if path, err := exec.LookPath("pwsh.exe"); err == nil {
-			cmd = exec.Command(path, "-NoLogo", "-NoExit", "-Command",
-				`Write-Host ""; Write-Host "Type 'exit' to return to cagent 🐳"`)
-		} else if path, err := exec.LookPath("powershell.exe"); err == nil {
-			cmd = exec.Command(path, "-NoLogo", "-NoExit", "-Command",
-				`Write-Host ""; Write-Host "Type 'exit' to return to cagent 🐳"`)
-		} else {
-			shell := cmp.Or(os.Getenv("ComSpec"), "cmd.exe")
-			cmd = exec.Command(shell, "/K", `echo. & echo Type 'exit' to return to cagent`)
-		}
-	} else {
-		shell := cmp.Or(os.Getenv("SHELL"), "/bin/sh")
-		cmd = exec.Command(shell, "-i", "-c",
-			`echo -e "\nType 'exit' to return to cagent 🐳"; exec `+shell)
-	}
+	cmd := newInteractiveShellCmd("Type 'exit' to return to " + m.appName)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return m, tea.ExecProcess(cmd, nil)
+}
+
+// newInteractiveShellCmd returns a command that launches the user's preferred
+// interactive shell. The command is owned by tea.ExecProcess, not by any
+// request-scoped context, so exec.Command is intentional.
+func newInteractiveShellCmd(exitMsg string) *exec.Cmd {
+	if goruntime.GOOS != "windows" {
+		shell := shellpath.DetectUnixShell()
+		return execCmd(shell, "-i", "-c", `echo -e "\n`+exitMsg+`"; exec `+shell)
+	}
+
+	psArgs := []string{"-NoLogo", "-NoExit", "-Command", `Write-Host ""; Write-Host "` + exitMsg + `"`}
+	if path, err := exec.LookPath("pwsh.exe"); err == nil {
+		return execCmd(path, psArgs...)
+	}
+	if path, err := exec.LookPath("powershell.exe"); err == nil {
+		return execCmd(path, psArgs...)
+	}
+	// Use absolute path to cmd.exe to prevent PATH hijacking (CWE-426).
+	return execCmd(shellpath.WindowsCmdExe(), "/K", "echo. & echo "+exitMsg)
+}
+
+// execCmd is a thin wrapper around exec.Command used for interactive
+// processes whose lifecycle is owned by tea.ExecProcess (not a context).
+func execCmd(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...) //nolint:noctx // owned by tea.ExecProcess
 }

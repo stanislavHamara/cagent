@@ -8,12 +8,12 @@ import (
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/session"
 )
 
 func Run(ctx context.Context, agentFilename string, stdin io.Reader, stdout io.Writer, runConfig *config.RuntimeConfig, sessionDB string) error {
-	slog.Debug("Starting ACP server", "agent", agentFilename, "session_db", sessionDB)
+	slog.DebugContext(ctx, "Starting ACP server", "agent", agentFilename, "session_db", sessionDB)
 
 	agentSource, err := config.Resolve(agentFilename, nil)
 	if err != nil {
@@ -36,7 +36,7 @@ func Run(ctx context.Context, agentFilename string, stdin io.Reader, stdout io.W
 	acpAgent.SetAgentConnection(conn)
 	defer acpAgent.Stop(ctx)
 
-	slog.Debug("acp started, waiting for conn")
+	slog.DebugContext(ctx, "acp started, waiting for conn")
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

@@ -14,8 +14,8 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/docker/cagent/pkg/tui/components/scrollbar"
-	"github.com/docker/cagent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/components/scrollbar"
+	"github.com/docker/docker-agent/pkg/tui/messages"
 )
 
 // ScrollKeyMap defines which keys trigger scroll actions.
@@ -52,9 +52,6 @@ func ReadOnlyScrollKeyMap() *ScrollKeyMap {
 }
 
 type Option func(*Model)
-
-// WithGapWidth sets the space columns between content and scrollbar (default 1).
-func WithGapWidth(n int) Option { return func(m *Model) { m.gapWidth = n } }
 
 // WithReserveScrollbarSpace always reserves gap+scrollbar columns, preventing layout shifts.
 func WithReserveScrollbarSpace(v bool) Option {

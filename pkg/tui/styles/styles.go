@@ -7,9 +7,9 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/glamour/v2/ansi"
 	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/chroma/v2"
-	"github.com/charmbracelet/glamour/v2/ansi"
 )
 
 const (
@@ -25,11 +25,13 @@ var (
 	BackgroundAlt color.Color
 
 	// Primary accent colors
+
 	White    color.Color
 	MobyBlue color.Color
 	Accent   color.Color
 
 	// Status colors
+
 	Success   color.Color
 	Error     color.Color
 	Warning   color.Color
@@ -37,33 +39,39 @@ var (
 	Highlight color.Color
 
 	// Text hierarchy
+
 	TextPrimary   color.Color
 	TextSecondary color.Color
 	TextMuted     color.Color
 	TextMutedGray color.Color
 
 	// Border colors
+
 	BorderPrimary   color.Color
 	BorderSecondary color.Color
 	BorderMuted     color.Color
 	BorderWarning   color.Color
 
 	// Diff colors
+
 	DiffAddBg    color.Color
 	DiffRemoveBg color.Color
 	DiffAddFg    color.Color
 	DiffRemoveFg color.Color
 
 	// UI element colors
+
 	LineNumber color.Color
 	Separator  color.Color
 
 	// Interactive element colors
+
 	Selected         color.Color
 	SelectedFg       color.Color
 	PlaceholderColor color.Color
 
 	// Badge colors
+
 	AgentBadgeFg color.Color
 	AgentBadgeBg color.Color
 	BadgePurple  color.Color
@@ -71,13 +79,16 @@ var (
 	BadgeGreen   color.Color
 
 	// Error colors (extended)
+
 	ErrorStrong color.Color
 	ErrorDark   color.Color
 
 	// Additional muted colors
+
 	FadedGray color.Color
 
 	// Tabs
+
 	TabBg         color.Color
 	TabPrimaryFg  color.Color
 	TabAccentFg   color.Color
@@ -248,6 +259,7 @@ var (
 					Foreground(White)
 
 	// Badge styles for model picker - use color vars set by ApplyTheme()
+
 	BadgeAlloyStyle = BaseStyle.
 			Foreground(BadgePurple)
 
@@ -373,6 +385,7 @@ var (
 	SuggestionCursorStyle = BaseStyle.Background(Accent).Foreground(TextMutedGray)
 
 	// Attachment banner styles - polished look with subtle border
+
 	AttachmentBannerStyle = BaseStyle.
 				Foreground(TextSecondary)
 
@@ -391,8 +404,8 @@ var (
 // Scrollbar
 var (
 	TrackStyle       = lipgloss.NewStyle().Foreground(BorderSecondary)
-	ThumbStyle       = lipgloss.NewStyle().Foreground(Info).Background(BackgroundAlt).Bold(true)
-	ThumbActiveStyle = lipgloss.NewStyle().Foreground(White).Background(BackgroundAlt).Bold(true)
+	ThumbStyle       = lipgloss.NewStyle().Foreground(Info).Background(BackgroundAlt)
+	ThumbActiveStyle = lipgloss.NewStyle().Foreground(White).Background(BackgroundAlt)
 )
 
 // Resize Handle Style

@@ -3,19 +3,21 @@ package chat
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	"github.com/atotto/clipboard"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/tui/components/messages"
-	"github.com/docker/cagent/pkg/tui/components/notification"
-	"github.com/docker/cagent/pkg/tui/components/sidebar"
-	"github.com/docker/cagent/pkg/tui/components/tool/editfile"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	msgtypes "github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/app"
+	"github.com/docker/docker-agent/pkg/tui/components/messages"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/sidebar"
+	"github.com/docker/docker-agent/pkg/tui/components/tool/editfile"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	msgtypes "github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 // handleKeyPress handles keyboard input events for the chat page.
@@ -81,11 +83,23 @@ func (p *chatPage) persistSessionTitle(newTitle string) tea.Cmd {
 			if errors.Is(err, app.ErrTitleGenerating) {
 				return notification.ShowMsg{Text: "Title is being generated, please wait", Type: notification.TypeWarning}
 			}
-			// Log other errors but don't show them
+			slog.Warn("Failed to persist session title", "title", newTitle, "error", err)
 			return nil
 		}
 		return nil
 	}
+}
+
+// copyWorkingDirToClipboard copies the working directory path to the system clipboard.
+func copyWorkingDirToClipboard(wd string) tea.Cmd {
+	return tea.Sequence(
+		func() tea.Msg {
+			_ = clipboard.WriteAll(wd)
+			return nil
+		},
+		tea.SetClipboard(wd),
+		notification.SuccessCmd("Working directory copied to clipboard."),
+	)
 }
 
 // handleMouseClick handles mouse click events.
@@ -125,6 +139,19 @@ func (p *chatPage) handleMouseClick(msg tea.MouseClickMsg) (layout.Model, tea.Cm
 			if p.sidebar.HandleTitleClick() {
 				p.sidebar.BeginTitleEdit()
 				return p, core.CmdHandler(msgtypes.RequestFocusMsg{Target: msgtypes.PanelSidebarTitle})
+			}
+			return p, nil
+		}
+
+	case TargetSidebarWorkingDir:
+		if msg.Button == tea.MouseLeft {
+			return p, copyWorkingDirToClipboard(p.sidebar.WorkingDirectory())
+		}
+
+	case TargetSidebarAgent:
+		if msg.Button == tea.MouseLeft {
+			if hit.AgentName != "" {
+				return p, core.CmdHandler(msgtypes.SwitchAgentMsg{AgentName: hit.AgentName})
 			}
 			return p, nil
 		}

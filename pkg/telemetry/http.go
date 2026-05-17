@@ -25,7 +25,7 @@ func (tc *Client) createEvent(eventName string, properties map[string]any) Event
 
 	// Allow callers to attach custom metadata to telemetry events
 	if tags := os.Getenv("TELEMETRY_TAGS"); tags != "" {
-		for _, pair := range strings.Split(tags, ",") {
+		for pair := range strings.SplitSeq(tags, ",") {
 			if k, v, ok := strings.Cut(pair, "="); ok && strings.TrimSpace(k) != "" {
 				allProperties[strings.TrimSpace(k)] = strings.TrimSpace(v)
 			}
@@ -34,6 +34,7 @@ func (tc *Client) createEvent(eventName string, properties map[string]any) Event
 
 	// Add system metadata AFTER tags so they cannot be overwritten
 	allProperties["user_uuid"] = tc.userUUID
+	allProperties["desktop_uuid"] = tc.desktopUUID
 	allProperties["version"] = tc.getVersion()
 	allProperties["os"] = osInfo
 	allProperties["os_language"] = osLanguage
@@ -122,15 +123,19 @@ func (tc *Client) performHTTPRequest(event *EventPayload, version string) error 
 		return fmt.Errorf("failed to marshal request to JSON: %w", err)
 	}
 
+	// Send request with timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Create HTTP request
-	req, err := http.NewRequest(http.MethodPost, tc.endpoint, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tc.endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("cagent/%s", version))
+	req.Header.Set("User-Agent", "cagent/"+version)
 	if tc.apiKey != "" && tc.header != "" {
 		req.Header.Set(tc.header, tc.apiKey)
 	}
@@ -146,11 +151,6 @@ func (tc *Client) performHTTPRequest(event *EventPayload, version string) error 
 		"payload_size", len(jsonData),
 		"payload", string(jsonData),
 	)
-
-	// Send request with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
 
 	resp, err := tc.httpClient.Do(req)
 	if err != nil {

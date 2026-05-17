@@ -9,9 +9,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 // MultiChoiceOption represents a single selectable option in the dialog.
@@ -98,6 +98,7 @@ type clickableRange struct {
 // multiChoiceDialog implements a reusable multi-choice selection dialog.
 type multiChoiceDialog struct {
 	BaseDialog
+
 	config            MultiChoiceConfig
 	selected          selection       // Currently selected item (-1 = none)
 	customInput       textinput.Model // Text input for custom response
@@ -621,7 +622,9 @@ func (d *multiChoiceDialog) View() string {
 	// Help text and buttons on same row
 	helpAndButtons := d.renderHelpAndButtons(contentWidth)
 	content.AddContent(helpAndButtons)
-	d.btnRow = rowIdx
+	// Cache the button row index so click handling in Update() can hit-test
+	// against the same layout that was just rendered.
+	d.btnRow = rowIdx //rubocop:disable Lint/TUIViewPurity // click-zone cache consumed by Update()
 
 	return styles.DialogStyle.Width(dialogWidth).Render(content.Build())
 }

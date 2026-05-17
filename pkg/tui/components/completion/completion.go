@@ -11,9 +11,9 @@ import (
 	"github.com/junegunn/fzf/src/algo"
 	"github.com/junegunn/fzf/src/util"
 
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 const maxItems = 10
@@ -52,8 +52,9 @@ type QueryMsg struct {
 }
 
 type SelectedMsg struct {
-	Value   string
-	Execute func() tea.Cmd
+	Value      string
+	Execute    func() tea.Cmd
+	AutoSubmit bool
 }
 
 // SelectionChangedMsg is sent when the selected item changes (for preview in editor)
@@ -88,6 +89,7 @@ type completionKeyMap struct {
 	Up     key.Binding
 	Down   key.Binding
 	Enter  key.Binding
+	Tab    key.Binding
 	Escape key.Binding
 }
 
@@ -103,8 +105,12 @@ func defaultCompletionKeyMap() completionKeyMap {
 			key.WithHelp("↓", "down"),
 		),
 		Enter: key.NewBinding(
-			key.WithKeys("enter", "tab"),
-			key.WithHelp("enter/tab", "select"),
+			key.WithKeys("enter"),
+			key.WithHelp("enter", "select"),
+		),
+		Tab: key.NewBinding(
+			key.WithKeys("tab"),
+			key.WithHelp("tab", "autocomplete"),
 		),
 		Escape: key.NewBinding(
 			key.WithKeys("esc"),
@@ -230,9 +236,14 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		case key.Matches(msg, c.keyMap.Up):
 			if c.selected > 0 {
 				c.selected--
+			} else if len(c.filteredItems) > 0 {
+				c.selected = len(c.filteredItems) - 1
 			}
 			if c.selected < c.scrollOffset {
 				c.scrollOffset = c.selected
+			}
+			if c.selected >= c.scrollOffset+maxItems {
+				c.scrollOffset = c.selected - maxItems + 1
 			}
 			cmd := c.notifySelectionChanged()
 			return c, cmd
@@ -240,6 +251,9 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		case key.Matches(msg, c.keyMap.Down):
 			if c.selected < len(c.filteredItems)-1 {
 				c.selected++
+			} else if len(c.filteredItems) > 0 {
+				c.selected = 0
+				c.scrollOffset = 0
 			}
 			if c.selected >= c.scrollOffset+maxItems {
 				c.scrollOffset = c.selected - maxItems + 1
@@ -255,8 +269,23 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 			selectedItem := c.filteredItems[c.selected]
 			return c, tea.Sequence(
 				core.CmdHandler(SelectedMsg{
-					Value:   selectedItem.Value,
-					Execute: selectedItem.Execute,
+					Value:      selectedItem.Value,
+					Execute:    selectedItem.Execute,
+					AutoSubmit: true,
+				}),
+				core.CmdHandler(ClosedMsg{}),
+			)
+		case key.Matches(msg, c.keyMap.Tab):
+			c.visible = false
+			if len(c.filteredItems) == 0 || c.selected >= len(c.filteredItems) {
+				return c, core.CmdHandler(ClosedMsg{})
+			}
+			selectedItem := c.filteredItems[c.selected]
+			return c, tea.Sequence(
+				core.CmdHandler(SelectedMsg{
+					Value:      selectedItem.Value,
+					Execute:    selectedItem.Execute,
+					AutoSubmit: false,
 				}),
 				core.CmdHandler(ClosedMsg{}),
 			)
@@ -343,7 +372,7 @@ func (c *manager) GetLayers() []*lipgloss.Layer {
 	yPos := max(c.height-viewHeight-editorHeight-1, 0)
 
 	return []*lipgloss.Layer{
-		lipgloss.NewLayer(view).SetContent(view).X(styles.AppPadding).Y(yPos),
+		lipgloss.NewLayer(view).X(styles.AppPadding).Y(yPos),
 	}
 }
 

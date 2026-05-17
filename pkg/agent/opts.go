@@ -3,10 +3,11 @@ package agent
 import (
 	"time"
 
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/config/types"
-	"github.com/docker/cagent/pkg/model/provider"
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/cache"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 type Opt func(a *Agent)
@@ -109,6 +110,16 @@ func WithAddEnvironmentInfo(addEnvironmentInfo bool) Opt {
 	}
 }
 
+// WithRedactSecrets enables all three halves of the redact_secrets
+// feature: the pre_tool_use builtin (via ApplyAgentDefaults), the
+// runtime's before_llm_call message transform, and the dispatcher's
+// tool-output scrub.
+func WithRedactSecrets(redactSecrets bool) Opt {
+	return func(a *Agent) {
+		a.redactSecrets = redactSecrets
+	}
+}
+
 func WithAddDescriptionParameter(addDescriptionParameter bool) Opt {
 	return func(a *Agent) {
 		a.addDescriptionParameter = addDescriptionParameter
@@ -127,6 +138,26 @@ func WithMaxIterations(maxIterations int) Opt {
 	}
 }
 
+// WithMaxConsecutiveToolCalls sets the threshold for consecutive identical tool
+// call detection. 0 means "use runtime default of 5". Negative values are
+// ignored.
+func WithMaxConsecutiveToolCalls(n int) Opt {
+	return func(a *Agent) {
+		if n >= 0 {
+			a.maxConsecutiveToolCalls = n
+		}
+	}
+}
+
+// WithMaxOldToolCallTokens sets the maximum token budget for old tool call content.
+// Set to -1 to disable truncation (unlimited tool content).
+// Set to 0 to use the default (40000).
+func WithMaxOldToolCallTokens(n int) Opt {
+	return func(a *Agent) {
+		a.maxOldToolCallTokens = n
+	}
+}
+
 func WithNumHistoryItems(numHistoryItems int) Opt {
 	return func(a *Agent) {
 		a.numHistoryItems = numHistoryItems
@@ -142,7 +173,7 @@ func WithCommands(commands types.Commands) Opt {
 func WithLoadTimeWarnings(warnings []string) Opt {
 	return func(a *Agent) {
 		for _, w := range warnings {
-			a.addToolWarning(w)
+			a.AddToolWarning(w)
 		}
 	}
 }
@@ -153,10 +184,9 @@ func WithHooks(hooks *latest.HooksConfig) Opt {
 	}
 }
 
-// WithThinkingConfigured sets whether thinking_budget was explicitly configured in the agent's YAML.
-// When true, the session will initialize with thinking enabled.
-func WithThinkingConfigured(configured bool) Opt {
+// WithCache attaches a response cache to the agent. Pass nil to disable.
+func WithCache(c *cache.Cache) Opt {
 	return func(a *Agent) {
-		a.thinkingConfigured = configured
+		a.cache = c
 	}
 }

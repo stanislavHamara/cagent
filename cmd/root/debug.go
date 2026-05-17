@@ -8,12 +8,12 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/cagent/pkg/cli"
-	"github.com/docker/cagent/pkg/config"
-	"github.com/docker/cagent/pkg/sessiontitle"
-	"github.com/docker/cagent/pkg/team"
-	"github.com/docker/cagent/pkg/teamloader"
-	"github.com/docker/cagent/pkg/telemetry"
+	"github.com/docker/docker-agent/pkg/cli"
+	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/sessiontitle"
+	"github.com/docker/docker-agent/pkg/team"
+	"github.com/docker/docker-agent/pkg/teamloader"
+	"github.com/docker/docker-agent/pkg/telemetry"
 )
 
 type debugFlags struct {
@@ -54,33 +54,33 @@ func newDebugCmd() *cobra.Command {
 
 	addRuntimeConfigFlags(cmd, &flags.runConfig)
 
+	cmd.AddCommand(newDebugAuthCmd())
+	cmd.AddCommand(newDebugOAuthCmd())
+
 	return cmd
 }
 
-// loadTeam loads an agent team from the given agent file and returns
-// a cleanup function that must be deferred by the caller.
-func (f *debugFlags) loadTeam(ctx context.Context, agentFilename string, opts ...teamloader.Opt) (*team.Team, func(), error) {
+// loadTeam loads an agent team from the given agent file.
+// Callers should defer stopToolSets(t) to clean up.
+func (f *debugFlags) loadTeam(ctx context.Context, agentFilename string, opts ...teamloader.Opt) (*team.Team, error) {
 	agentSource, err := config.Resolve(agentFilename, f.runConfig.EnvProvider())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	t, err := teamloader.Load(ctx, agentSource, &f.runConfig, opts...)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	cleanup := func() {
-		if err := t.StopToolSets(ctx); err != nil {
-			slog.Error("Failed to stop tool sets", "error", err)
-		}
-	}
-
-	return t, cleanup, nil
+	return t, nil
 }
 
-func (f *debugFlags) runDebugConfigCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("debug", append([]string{"config"}, args...))
+func (f *debugFlags) runDebugConfigCommand(cmd *cobra.Command, args []string) (commandErr error) {
+	telemetry.TrackCommand(cmd.Context(), "debug", append([]string{"config"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(cmd.Context(), "debug", append([]string{"config"}, args...), commandErr)
+	}()
 
 	agentSource, err := config.Resolve(args[0], f.runConfig.EnvProvider())
 	if err != nil {
@@ -95,29 +95,32 @@ func (f *debugFlags) runDebugConfigCommand(cmd *cobra.Command, args []string) er
 	return yaml.NewEncoder(cmd.OutOrStdout()).Encode(cfg)
 }
 
-func (f *debugFlags) runDebugToolsetsCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("debug", append([]string{"toolsets"}, args...))
+func (f *debugFlags) runDebugToolsetsCommand(cmd *cobra.Command, args []string) (commandErr error) {
+	telemetry.TrackCommand(cmd.Context(), "debug", append([]string{"toolsets"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(cmd.Context(), "debug", append([]string{"toolsets"}, args...), commandErr)
+	}()
 
 	ctx := cmd.Context()
 
-	t, cleanup, err := f.loadTeam(ctx, args[0])
+	t, err := f.loadTeam(ctx, args[0])
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer stopToolSets(t)
 
 	out := cli.NewPrinter(cmd.OutOrStdout())
 
 	for _, name := range t.AgentNames() {
 		agent, err := t.Agent(name)
 		if err != nil {
-			slog.Error("Failed to get agent", "name", name, "error", err)
+			slog.ErrorContext(ctx, "Failed to get agent", "name", name, "error", err)
 			continue
 		}
 
 		tools, err := agent.Tools(ctx)
 		if err != nil {
-			slog.Error("Failed to query tools", "name", agent.Name(), "error", err)
+			slog.ErrorContext(ctx, "Failed to query tools", "name", agent.Name(), "error", err)
 			continue
 		}
 
@@ -135,23 +138,26 @@ func (f *debugFlags) runDebugToolsetsCommand(cmd *cobra.Command, args []string) 
 	return nil
 }
 
-func (f *debugFlags) runDebugTitleCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("debug", append([]string{"title"}, args...))
+func (f *debugFlags) runDebugTitleCommand(cmd *cobra.Command, args []string) (commandErr error) {
+	telemetry.TrackCommand(cmd.Context(), "debug", append([]string{"title"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(cmd.Context(), "debug", append([]string{"title"}, args...), commandErr)
+	}()
 
 	ctx := cmd.Context()
 
-	t, cleanup, err := f.loadTeam(ctx, args[0], teamloader.WithModelOverrides(f.modelOverrides))
+	t, err := f.loadTeam(ctx, args[0], teamloader.WithModelOverrides(f.modelOverrides))
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer stopToolSets(t)
 
 	agent, err := t.DefaultAgent()
 	if err != nil {
 		return err
 	}
 
-	model := agent.Model()
+	model := agent.Model(ctx)
 	if model == nil {
 		return fmt.Errorf("agent %q has no model configured", agent.Name())
 	}

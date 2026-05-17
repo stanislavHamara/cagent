@@ -11,15 +11,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/tools"
-	"github.com/docker/cagent/pkg/tui/animation"
-	"github.com/docker/cagent/pkg/tui/components/reasoningblock"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	tuimessages "github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tui/animation"
+	"github.com/docker/docker-agent/pkg/tui/components/reasoningblock"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	tuimessages "github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	"github.com/docker/docker-agent/pkg/tui/types"
 )
 
 func TestViewDoesNotWrapWideLines(t *testing.T) {
@@ -685,18 +685,17 @@ func TestRenderCacheInvalidatesOnAnimationTickWithAnimatedContent(t *testing.T) 
 	m.views = append(m.views, m.createToolCallView(toolMsg))
 	m.renderDirty = true
 
-	// First render
-	view1 := m.View()
-	require.Contains(t, view1, "running_tool")
-
-	// Clear the dirty flag to simulate cached state
+	// First render populates the cache.
+	require.Contains(t, m.View(), "running_tool")
 	m.renderDirty = false
 
-	// Send animation tick - should invalidate cache because we have animated content
+	// An animation tick must refresh the cache so the spinner frame advances.
+	// onAnimationTick now re-renders eagerly inside Update, so the resulting
+	// View() output stays consistent with the latest tick.
 	m.Update(animation.TickMsg{Frame: 1})
 
-	// Cache should be marked dirty
-	assert.True(t, m.renderDirty, "renderDirty should be true after animation tick with animated content")
+	require.NotEmpty(t, m.renderedLines)
+	require.Contains(t, m.View(), "running_tool")
 }
 
 func TestRenderCacheNotInvalidatedOnAnimationTickWithoutAnimatedContent(t *testing.T) {
@@ -1114,6 +1113,50 @@ func TestBindingsIncludesEditKeyWhenUserMessageSelected(t *testing.T) {
 	assert.True(t, foundE, "Bindings should include 'e' key when user message is selected")
 }
 
+func TestAddOrUpdateToolCallFindsToolInNonActiveReasoningBlock(t *testing.T) {
+	t.Parallel()
+
+	sessionState := &service.SessionState{}
+	m := NewScrollableView(80, 24, sessionState).(*model)
+	m.SetSize(80, 24)
+
+	agentName := "root"
+	toolCall := tools.ToolCall{
+		ID:       "call_1",
+		Function: tools.FunctionCall{Name: "go_workspace", Arguments: `{}`},
+	}
+	toolDef := tools.Tool{Name: "go_workspace"}
+
+	// Step 1: Add a reasoning block and a tool call inside it (simulates PartialToolCallEvent)
+	m.AppendReasoning(agentName, "Thinking...")
+	require.Len(t, m.messages, 1)
+	assert.Equal(t, types.MessageTypeAssistantReasoningBlock, m.messages[0].Type)
+
+	m.AddOrUpdateToolCall(agentName, toolCall, toolDef, types.ToolStatusPending)
+	block, ok := m.views[0].(*reasoningblock.Model)
+	require.True(t, ok)
+	require.True(t, block.HasToolCall("call_1"))
+
+	// Step 2: Append an assistant message so the reasoning block is no longer the last message
+	m.AppendToLastMessage(agentName, "Here is the answer.")
+	require.Len(t, m.messages, 2)
+	assert.Equal(t, types.MessageTypeAssistant, m.messages[1].Type)
+
+	// Step 3: Update the tool call to Running (simulates ToolCallEvent)
+	// Before the fix, this would not find the tool in the old reasoning block
+	// and would create a duplicate standalone entry.
+	m.AddOrUpdateToolCall(agentName, toolCall, toolDef, types.ToolStatusRunning)
+
+	// Verify: still only 2 messages (no duplicate tool call created)
+	assert.Len(t, m.messages, 2, "should not create a duplicate tool call message")
+
+	// Verify the tool call in the reasoning block was updated (not duplicated)
+	block, ok = m.views[0].(*reasoningblock.Model)
+	require.True(t, ok)
+	assert.True(t, block.HasToolCall("call_1"))
+	assert.Equal(t, 1, block.ToolCount(), "reasoning block should still have exactly one tool call")
+}
+
 func TestBindingsExcludesEditKeyWhenAssistantMessageSelected(t *testing.T) {
 	t.Parallel()
 
@@ -1139,4 +1182,89 @@ func TestBindingsExcludesEditKeyWhenAssistantMessageSelected(t *testing.T) {
 		}
 	}
 	assert.False(t, foundE, "Bindings should NOT include 'e' key when assistant message is selected")
+}
+
+func TestKeyGAndShiftGScrollMessagesView(t *testing.T) {
+	t.Parallel()
+
+	sessionState := &service.SessionState{}
+	m := NewScrollableView(80, 10, sessionState).(*model)
+	m.SetSize(80, 10)
+
+	// Add enough messages to require scrolling.
+	for i := range 20 {
+		content := "Message " + strconv.Itoa(i) + ": " + strings.Repeat("line\n", 5)
+		msg := types.Agent(types.MessageTypeAssistant, "root", content)
+		m.messages = append(m.messages, msg)
+		m.views = append(m.views, m.createMessageView(msg))
+	}
+
+	// Select the messages view.
+	m.Focus()
+
+	// Render once to compute layout (auto-scrolls to the bottom).
+	m.View()
+	require.Positive(t, m.scrollOffset, "precondition: should not start at the top")
+
+	// 'g' jumps to the very top of the view.
+	m.Update(tea.KeyPressMsg{Code: 'g'})
+	assert.Equal(t, 0, m.scrollOffset, "g should scroll to the top")
+
+	// 'G' jumps back to the very bottom of the view.
+	m.Update(tea.KeyPressMsg{Code: 'G'})
+	m.View() // apply scroll clamp
+	wantOffset := max(0, m.totalScrollableHeight()-m.height)
+	assert.Equal(t, wantOffset, m.scrollOffset, "G should scroll to the bottom")
+}
+
+func TestKeyGAndGWithEmptyMessages(t *testing.T) {
+	t.Parallel()
+
+	sessionState := &service.SessionState{}
+	m := NewScrollableView(80, 10, sessionState).(*model)
+	m.SetSize(80, 10)
+
+	// No messages - should not panic
+	m.Update(tea.KeyPressMsg{Code: 'g'})
+	assert.Equal(t, 0, m.scrollOffset, "g with empty messages should set offset to 0")
+
+	m.Update(tea.KeyPressMsg{Code: 'G'})
+	assert.Equal(t, 0, m.scrollOffset, "G with empty messages should set offset to 0")
+}
+
+func TestKeyGAndGDuringInlineEdit(t *testing.T) {
+	t.Parallel()
+
+	sessionState := &service.SessionState{}
+	m := NewScrollableView(80, 10, sessionState).(*model)
+	m.SetSize(80, 10)
+
+	sessionPos := 0
+	userMsg := &types.Message{
+		Type:            types.MessageTypeUser,
+		Content:         "test",
+		SessionPosition: &sessionPos,
+	}
+	m.messages = append(m.messages, userMsg)
+	m.views = append(m.views, m.createMessageView(userMsg))
+
+	// Start inline edit
+	m.StartInlineEdit(0, 0, "test")
+	require.Equal(t, 0, m.inlineEditMsgIndex, "should be in inline edit mode")
+
+	initialValue := m.inlineEditTextarea.Value()
+	initialOffset := m.scrollOffset
+
+	// 'g' should be forwarded to textarea, not trigger scroll
+	m.Update(tea.KeyPressMsg(tea.Key{Code: 'g', Text: "g"}))
+	assert.Contains(t, m.inlineEditTextarea.Value(), "g", "g should be typed into textarea during inline edit")
+	assert.NotEqual(t, initialValue, m.inlineEditTextarea.Value(), "textarea value should change")
+
+	// Scroll offset should not change
+	assert.Equal(t, initialOffset, m.scrollOffset, "scroll offset should not change during inline edit")
+
+	// 'G' should also be forwarded to textarea
+	m.Update(tea.KeyPressMsg(tea.Key{Code: 'G', Text: "G"}))
+	assert.Contains(t, m.inlineEditTextarea.Value(), "G", "G should be typed into textarea during inline edit")
+	assert.Equal(t, initialOffset, m.scrollOffset, "scroll offset should not change during inline edit")
 }

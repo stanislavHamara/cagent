@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/environment"
 )
 
 func TestAutoRegisterModels(t *testing.T) {
@@ -202,6 +202,15 @@ type noEnvProvider struct{}
 
 func (p *noEnvProvider) Get(context.Context, string) (string, bool) { return "", false }
 
+type fakeEnvProvider struct {
+	vars map[string]string
+}
+
+func (p *fakeEnvProvider) Get(_ context.Context, name string) (string, bool) {
+	v, ok := p.vars[name]
+	return v, ok
+}
+
 func TestCheckRequiredEnvVars(t *testing.T) {
 	t.Parallel()
 
@@ -282,12 +291,29 @@ func TestCheckRequiredEnvVars(t *testing.T) {
 func TestCheckRequiredEnvVarsWithModelGateway(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := Load(t.Context(), NewFileSource("testdata/env/all.yaml"))
-	require.NoError(t, err)
+	t.Run("with token", func(t *testing.T) {
+		t.Parallel()
 
-	err = CheckRequiredEnvVars(t.Context(), cfg, "gateway:8080", &noEnvProvider{})
+		cfg, err := Load(t.Context(), NewFileSource("testdata/env/all.yaml"))
+		require.NoError(t, err)
 
-	require.NoError(t, err)
+		env := &fakeEnvProvider{vars: map[string]string{
+			environment.DockerDesktopTokenEnv: "some-jwt-token",
+		}}
+
+		err = CheckRequiredEnvVars(t.Context(), cfg, "gateway:8080", env)
+		require.NoError(t, err)
+	})
+
+	t.Run("without token", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := Load(t.Context(), NewFileSource("testdata/env/all.yaml"))
+		require.NoError(t, err)
+
+		err = CheckRequiredEnvVars(t.Context(), cfg, "gateway:8080", &noEnvProvider{})
+		require.ErrorContains(t, err, "sign in Docker Desktop")
+	})
 }
 
 func TestApplyModelOverrides(t *testing.T) {
@@ -440,6 +466,153 @@ func TestApplyModelOverrides(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_ExternalSubAgentReferences(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cfg     *latest.Config
+		wantErr string
+	}{
+		{
+			name: "OCI reference in sub_agents is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"agentcatalog/pirate"}},
+				},
+			},
+		},
+		{
+			name: "OCI reference with tag in sub_agents is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"docker.io/myorg/myagent:v1"}},
+				},
+			},
+		},
+		{
+			name: "mix of local and external sub_agents",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"helper", "agentcatalog/pirate"}},
+					{Name: "helper", Model: "openai/gpt-4o"},
+				},
+			},
+		},
+		{
+			name: "non-existent local sub_agent still fails",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"does_not_exist"}},
+				},
+			},
+			wantErr: "non-existent sub-agent 'does_not_exist'",
+		},
+		{
+			name: "URL reference in sub_agents is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"https://example.com/agent.yaml"}},
+				},
+			},
+		},
+		{
+			name: "OCI reference in handoffs is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", Handoffs: []string{"agentcatalog/pirate"}},
+				},
+			},
+		},
+		{
+			name: "non-existent local handoff fails",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", Handoffs: []string{"does_not_exist"}},
+				},
+			},
+			wantErr: "non-existent handoff agent 'does_not_exist'",
+		},
+		{
+			name: "named OCI reference in sub_agents is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"reviewer:agentcatalog/review-pr"}},
+				},
+			},
+		},
+		{
+			name: "named URL reference in sub_agents is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"myagent:https://example.com/agent.yaml"}},
+				},
+			},
+		},
+		{
+			name: "named OCI reference in handoffs is allowed",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", Handoffs: []string{"reviewer:agentcatalog/review-pr"}},
+				},
+			},
+		},
+		{
+			name: "external sub-agent name collides with local agent",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"pirate", "agentcatalog/pirate"}},
+					{Name: "pirate", Model: "openai/gpt-4o"},
+				},
+			},
+			wantErr: "conflicts with a locally-defined agent",
+		},
+		{
+			name: "named external sub-agent collides with local agent",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", SubAgents: []string{"helper", "helper:agentcatalog/review-pr"}},
+					{Name: "helper", Model: "openai/gpt-4o"},
+				},
+			},
+			wantErr: "conflicts with a locally-defined agent",
+		},
+		{
+			name: "external handoff name collides with local agent",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", Handoffs: []string{"agentcatalog/pirate"}},
+					{Name: "pirate", Model: "openai/gpt-4o"},
+				},
+			},
+			wantErr: "conflicts with a locally-defined agent",
+		},
+		{
+			name: "local handoff to another agent passes",
+			cfg: &latest.Config{
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o", Handoffs: []string{"helper"}},
+					{Name: "helper", Model: "openai/gpt-4o"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateConfig(tt.cfg)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestProviders_Validation(t *testing.T) {
 	t.Parallel()
 
@@ -506,6 +679,46 @@ func TestProviders_Validation(t *testing.T) {
 				},
 			},
 			wantErr: "name cannot contain '/'",
+		},
+		{
+			name: "valid anthropic provider without base_url",
+			providers: map[string]latest.ProviderConfig{
+				"my_anthropic": {
+					Provider: "anthropic",
+					TokenKey: "MY_ANTHROPIC_KEY",
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "valid google provider with defaults",
+			providers: map[string]latest.ProviderConfig{
+				"my_google": {
+					Provider: "google",
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "openai provider without base_url requires it",
+			providers: map[string]latest.ProviderConfig{
+				"my_openai": {
+					Provider: "openai",
+				},
+			},
+			wantErr: "base_url is required",
+		},
+		{
+			name: "provider with model defaults",
+			providers: map[string]latest.ProviderConfig{
+				"my_anthropic": {
+					Provider:    "anthropic",
+					TokenKey:    "MY_KEY",
+					MaxTokens:   new(int64),
+					Temperature: new(float64),
+				},
+			},
+			wantErr: "",
 		},
 	}
 

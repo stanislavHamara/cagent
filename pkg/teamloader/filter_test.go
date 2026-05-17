@@ -8,11 +8,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 type mockToolSet struct {
 	tools.ToolSet
+
 	toolsFunc func(ctx context.Context) ([]tools.Tool, error)
 }
 
@@ -122,6 +123,7 @@ func TestWithToolsFilter_CaseSensitive(t *testing.T) {
 
 type instructableToolSet struct {
 	mockToolSet
+
 	instructions string
 }
 

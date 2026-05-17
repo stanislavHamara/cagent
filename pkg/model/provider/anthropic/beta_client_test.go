@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/docker/cagent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/chat"
 )
 
 // TestCountAnthropicTokensBeta_Success tests successful token counting for beta API
@@ -215,7 +215,8 @@ func TestExtractBetaSystemBlocks_MultipleSystemMessages(t *testing.T) {
 	assert.Equal(t, "Be concise", blocks[1].Text)
 }
 
-// TestExtractBetaSystemBlocks_SkipsEmptyText tests that empty system text is skipped
+// TestExtractBetaSystemBlocks_SkipsEmptyText tests that empty system text is skipped.
+// System blocks are trimmed because YAML literal-block instructions always append a trailing newline.
 func TestExtractBetaSystemBlocks_SkipsEmptyText(t *testing.T) {
 	msgs := []chat.Message{
 		{

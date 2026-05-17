@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"time"
@@ -18,28 +17,31 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/history"
-	"github.com/docker/cagent/pkg/runtime"
-	"github.com/docker/cagent/pkg/session"
-	"github.com/docker/cagent/pkg/tui/animation"
-	"github.com/docker/cagent/pkg/tui/commands"
-	"github.com/docker/cagent/pkg/tui/components/completion"
-	"github.com/docker/cagent/pkg/tui/components/editor"
-	"github.com/docker/cagent/pkg/tui/components/notification"
-	"github.com/docker/cagent/pkg/tui/components/spinner"
-	"github.com/docker/cagent/pkg/tui/components/statusbar"
-	"github.com/docker/cagent/pkg/tui/components/tabbar"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	"github.com/docker/cagent/pkg/tui/dialog"
-	"github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/page/chat"
-	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/service/supervisor"
-	"github.com/docker/cagent/pkg/tui/service/tuistate"
-	"github.com/docker/cagent/pkg/tui/styles"
-	"github.com/docker/cagent/pkg/userconfig"
+	"github.com/docker/docker-agent/pkg/app"
+	"github.com/docker/docker-agent/pkg/audio/transcribe"
+	"github.com/docker/docker-agent/pkg/history"
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/tui/animation"
+	"github.com/docker/docker-agent/pkg/tui/commands"
+	"github.com/docker/docker-agent/pkg/tui/components/completion"
+	"github.com/docker/docker-agent/pkg/tui/components/editor"
+	"github.com/docker/docker-agent/pkg/tui/components/editor/completions"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/spinner"
+	"github.com/docker/docker-agent/pkg/tui/components/statusbar"
+	"github.com/docker/docker-agent/pkg/tui/components/tabbar"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/dialog"
+	"github.com/docker/docker-agent/pkg/tui/internal/editorname"
+	"github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/page/chat"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	"github.com/docker/docker-agent/pkg/tui/service/supervisor"
+	"github.com/docker/docker-agent/pkg/tui/service/tuistate"
+	"github.com/docker/docker-agent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/userconfig"
+	"github.com/docker/docker-agent/pkg/version"
 )
 
 // SessionSpawner creates new sessions with their own runtime.
@@ -87,14 +89,20 @@ type appModel struct {
 	statusBar    statusbar.StatusBar
 	completions  completion.Manager
 
+	// Speech-to-text
+	transcriber  Transcriber
+	transcriptCh chan string // bridges transcriber goroutine → Bubble Tea event loop
+
 	// Working state indicator (resize handle spinner)
 	workingSpinner spinner.Spinner
+
+	// animFrame is the current animation frame, used to rotate the window
+	// title spinner so that tmux can detect pane activity.
+	animFrame int
 
 	// Window state
 	wWidth, wHeight int
 	width, height   int
-
-	cancelThinkingCheck context.CancelFunc // cancels the in-flight thinking toggle check
 
 	// Content area height (height minus editor, tab bar, resize handle, status bar)
 	contentHeight int
@@ -113,6 +121,31 @@ type appModel struct {
 	// keyboardEnhancementsSupported tracks whether the terminal supports keyboard enhancements
 	keyboardEnhancementsSupported bool
 
+	// program holds a reference to the tea.Program so that we can
+	// perform a full terminal release/restore cycle on focus events.
+	program *tea.Program
+
+	// dockerDesktop is true when running inside Docker Desktop's terminal
+	// (TERM_PROGRAM=docker_desktop). Focus reporting and the terminal
+	// release/restore cycle on tab switch are only enabled in this
+	// environment.
+	dockerDesktop bool
+
+	// focused tracks whether the terminal currently has focus. Used to
+	// filter spurious FocusMsg events (RestoreTerminal re-enables focus
+	// reporting and delivers one even though we never blurred). Starts
+	// at the zero value (false) so the first FocusMsg is treated as a
+	// real focus event — in Docker Desktop that runs the release/restore
+	// cycle which re-emits terminal mode escape sequences.
+	focused bool
+
+	// tickPaused is true while we should drop animation.TickMsg events
+	// (and let the tick chain die). Set on BlurMsg and cleared on the
+	// next real FocusMsg. Tracked separately from `focused` so that ticks
+	// keep flowing at startup even before any focus event arrives — some
+	// terminals never send FocusMsg.
+	tickPaused bool
+
 	// pendingRestores maps runtime tab IDs (supervisor routing keys) to
 	// persisted session-store IDs. When a tab with a pending restore is first
 	// switched to, the persisted session is loaded via replaceActiveSession —
@@ -128,16 +161,104 @@ type appModel struct {
 	// restored tab (in handleSwitchTab) and then removed from the map.
 	pendingSidebarCollapsed map[string]bool
 
+	// stashedDialogs holds background dialog instances that were on screen
+	// when the user navigated away from a tab. The dialog instance preserves
+	// in-progress input (e.g. text typed into a user_prompt elicitation) so
+	// that returning to the tab restores the same dialog rather than
+	// rebuilding a fresh one from the originating runtime event.
+	//
+	// The stored event is matched against the supervisor's pending event on
+	// return: if they no longer match (because the agent superseded the
+	// prompt) the stashed dialog is discarded and a fresh one is built.
+	stashedDialogs map[string]stashedDialog
+
 	// pendingActiveTab is the tab ID to switch to on Init(). Set when the
 	// previously focused tab differs from the initial tab.
 	pendingActiveTab string
 
 	ready bool
 	err   error
+
+	// leanMode enables a simplified TUI with minimal chrome.
+	leanMode bool
+
+	// buildCommandCategories is a function that returns the list of command categories.
+	buildCommandCategories func(context.Context, tea.Model) []commands.Category
+
+	appName    string
+	appVersion string
+}
+
+// Transcriber is the speech-to-text interface used by the TUI. It is an
+// interface (rather than the concrete *transcribe.Transcriber) so that tests
+// can inject a fake implementation via WithTranscriber and so that the TUI
+// does not depend on a concrete audio backend.
+type Transcriber interface {
+	Start(ctx context.Context, handler transcribe.TranscriptHandler) error
+	Stop()
+	IsRunning() bool
+	IsSupported() bool
+}
+
+// Option configures the TUI.
+type Option func(*appModel)
+
+// WithLeanMode enables a simplified TUI with minimal chrome:
+// no sidebar, no tab bar, no overlays, no resize handle.
+func WithLeanMode() Option {
+	return func(m *appModel) {
+		m.leanMode = true
+	}
+}
+
+// WithAppName sets the application name.
+//
+// If not provided, defaults to "docker agent".
+func WithAppName(name string) Option {
+	return func(m *appModel) {
+		m.appName = name
+	}
+}
+
+// WithVersion sets the application version.
+//
+// If not provided, defaults to version.Version.
+func WithVersion(v string) Option {
+	return func(m *appModel) {
+		m.appVersion = v
+	}
+}
+
+// WithCommandBuilder builds the command categories shown in the command
+// palette from the given function. It overrides the default command category
+// builder. To include the default commands, the given function should call
+// commands.BuildCommandCategories and merge the result with its own.
+//
+// The tea.Model passed to the builder function must not be accessed during
+// the build call itself - it should only be captured for use within command
+// Execute functions. There is no guarantee that the tea.Model holds all
+// dependencies during the build phase, which may cause [core.Resolve] to panic.
+func WithCommandBuilder(
+	fn func(context.Context, tea.Model) []commands.Category,
+) Option {
+	return func(m *appModel) {
+		m.buildCommandCategories = fn
+	}
+}
+
+// WithTranscriber overrides the speech-to-text backend used by the TUI. This
+// is intended for tests that need to exercise speech handlers without
+// connecting to a real audio device or external API.
+func WithTranscriber(t Transcriber) Option {
+	return func(m *appModel) {
+		if t != nil {
+			m.transcriber = t
+		}
+	}
 }
 
 // New creates a new Model.
-func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initialWorkingDir string, cleanup func()) tea.Model {
+func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initialWorkingDir string, cleanup func(), opts ...Option) tea.Model {
 	// Initialize supervisor
 	sv := supervisor.New(spawner)
 
@@ -150,44 +271,63 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 	var tsErr error
 	ts, tsErr = tuistate.New()
 	if tsErr != nil {
-		slog.Warn("Failed to open TUI state store, tabs won't persist", "error", tsErr)
+		slog.WarnContext(ctx, "Failed to open TUI state store, tabs won't persist", "error", tsErr)
 	}
 
 	// Initialize shared command history
-	historyStore, err := history.New()
+	historyStore, err := history.New("")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to initialize command history: %v\n", err)
+		slog.WarnContext(ctx, "Failed to initialize command history", "error", err)
 	}
 
 	initialSessionState := service.NewSessionState(initialApp.Session())
-	initialChatPage := chat.New(initialApp, initialSessionState)
-	initialEditor := editor.New(initialApp, historyStore)
 	sessID := initialApp.Session().ID
 
 	m := &appModel{
+		buildCommandCategories: func(ctx context.Context, _ tea.Model) []commands.Category {
+			return commands.BuildCommandCategories(ctx, initialApp)
+		},
 		supervisor:              sv,
 		tabBar:                  tb,
 		tuiStore:                ts,
-		chatPages:               map[string]chat.Page{sessID: initialChatPage},
+		chatPages:               map[string]chat.Page{},
+		editors:                 map[string]editor.Editor{},
 		sessionStates:           map[string]*service.SessionState{sessID: initialSessionState},
-		editors:                 map[string]editor.Editor{sessID: initialEditor},
 		application:             initialApp,
 		sessionState:            initialSessionState,
-		chatPage:                initialChatPage,
-		editor:                  initialEditor,
 		history:                 historyStore,
 		pendingRestores:         make(map[string]string),
 		pendingSidebarCollapsed: make(map[string]bool),
+		stashedDialogs:          make(map[string]stashedDialog),
 		notification:            notification.New(),
 		dialogMgr:               dialog.New(),
 		completions:             completion.New(),
+		transcriber:             transcribe.New(os.Getenv("OPENAI_API_KEY")),
 		workingSpinner:          spinner.New(spinner.ModeSpinnerOnly, styles.SpinnerDotsHighlightStyle),
 		focusedPanel:            PanelEditor,
 		editorLines:             3,
+		dockerDesktop:           os.Getenv("TERM_PROGRAM") == "docker_desktop",
+		appName:                 "docker agent",
+		appVersion:              version.Version,
 	}
 
+	// Apply options
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	// Create initial editor (after options are applied so command builder is set)
+	initialEditor := editor.New(historyStore, m.editorOpts()...)
+	m.editors[sessID] = initialEditor
+	m.editor = initialEditor
+
+	// Create initial chat page (after options are applied so leanMode is set)
+	initialChatPage := chat.New(initialApp, initialSessionState, m.chatPageOpts()...)
+	m.chatPages[sessID] = initialChatPage
+	m.chatPage = initialChatPage
+
 	// Initialize status bar (pass m as help provider)
-	m.statusBar = statusbar.New(m)
+	m.statusBar = statusbar.New(m, statusbar.WithTitle(m.appName+" "+m.appVersion))
 
 	// Add the initial session to the supervisor
 	sv.AddSession(ctx, initialApp, initialApp.Session(), initialWorkingDir, cleanup)
@@ -215,8 +355,26 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 	return m
 }
 
+// Resolve implements dependency resolution for the appModel.
+// See core.Resolve for additional information.
+func (m *appModel) Resolve(v any) any {
+	switch v.(type) {
+	case **app.App:
+		return m.application
+	case **service.SessionState:
+		return m.sessionState
+	case *chat.Page:
+		return m.chatPage
+	case *editor.Editor:
+		return m.editor
+	}
+
+	return nil
+}
+
 // SetProgram sets the tea.Program for the supervisor to send routed messages.
 func (m *appModel) SetProgram(p *tea.Program) {
+	m.program = p
 	m.supervisor.SetProgram(p)
 }
 
@@ -227,10 +385,35 @@ func (m *appModel) reapplyKeyboardEnhancements() {
 	if m.keyboardEnhancements == nil {
 		return
 	}
-	updated, _ := m.chatPage.Update(*m.keyboardEnhancements)
-	m.chatPage = updated.(chat.Page)
-	editorModel, _ := m.editor.Update(*m.keyboardEnhancements)
-	m.editor = editorModel.(editor.Editor)
+	_ = m.updateChatCmd(*m.keyboardEnhancements)
+	_ = m.updateEditorCmd(*m.keyboardEnhancements)
+}
+
+func (m *appModel) commandCategories() []commands.Category {
+	return m.buildCommandCategories(context.Background(), m)
+}
+
+// chatPageOpts returns the chat.PageOption slice derived from the current
+// appModel configuration (e.g. lean mode).
+func (m *appModel) chatPageOpts() []chat.PageOption {
+	opts := []chat.PageOption{
+		chat.WithCommandParser(commands.NewParser(m.commandCategories()...)),
+	}
+
+	if m.leanMode {
+		opts = append(opts, chat.WithLeanMode())
+	}
+	return opts
+}
+
+// editorOpts returns the editor.Option slice derived from the current appModel.
+func (m *appModel) editorOpts() []editor.Option {
+	return []editor.Option{
+		editor.WithCompletions(
+			completions.NewCommandCompletion(m.commandCategories()),
+			completions.NewFileCompletion(),
+		),
+	}
 }
 
 // initSessionComponents creates a new chat page, session state, and editor for
@@ -238,8 +421,8 @@ func (m *appModel) reapplyKeyboardEnhancements() {
 // convenience pointers (m.chatPage, m.sessionState, m.editor) are also updated.
 func (m *appModel) initSessionComponents(tabID string, a *app.App, sess *session.Session) {
 	ss := service.NewSessionState(sess)
-	cp := chat.New(a, ss)
-	ed := editor.New(a, m.history)
+	cp := chat.New(a, ss, m.chatPageOpts()...)
+	ed := editor.New(m.history, m.editorOpts()...)
 
 	m.chatPages[tabID] = cp
 	m.sessionStates[tabID] = ss
@@ -261,117 +444,6 @@ func (m *appModel) initAndFocusComponents() tea.Cmd {
 		m.editor.Focus(),
 		m.resizeAll(),
 	)
-}
-
-// persistActiveTab writes the active tab ID to the tuistate store.
-func (m *appModel) persistActiveTab(persistedID string) {
-	if m.tuiStore == nil {
-		return
-	}
-	if err := m.tuiStore.SetActiveTab(context.Background(), persistedID); err != nil {
-		slog.Warn("Failed to set active tab", "error", err)
-	}
-}
-
-// persistFreshTab clears the tab store and writes a single initial tab.
-func (m *appModel) persistFreshTab(ctx context.Context, sessionID, workingDir string) {
-	if m.tuiStore == nil {
-		return
-	}
-	if err := m.tuiStore.ClearTabs(ctx); err != nil {
-		slog.Warn("Failed to clear tabs", "error", err)
-	}
-	if err := m.tuiStore.AddTab(ctx, sessionID, workingDir); err != nil {
-		slog.Warn("Failed to persist initial tab", "error", err)
-	}
-	if err := m.tuiStore.SetActiveTab(ctx, sessionID); err != nil {
-		slog.Warn("Failed to set active tab", "error", err)
-	}
-}
-
-// restoreTabs restores previously persisted tabs (if enabled) or persists the
-// initial session as the sole tab. The tuistate DB always stores persisted
-// session-store IDs. Runtime tab/routing IDs are ephemeral; the pendingRestores
-// map bridges the two:  pendingRestores[runtimeTabID] = persistedSessionID
-func (m *appModel) restoreTabs(
-	ctx context.Context,
-	ts *tuistate.Store,
-	sv *supervisor.Supervisor,
-	spawner SessionSpawner,
-	initialApp *app.App,
-	initialTabID, initialWorkingDir string,
-) {
-	if ts == nil {
-		return
-	}
-
-	var savedTabs []tuistate.TabEntry
-	var savedActiveID string
-	if *userconfig.Get().RestoreTabs {
-		savedTabs, savedActiveID, _ = ts.GetTabs(ctx)
-	}
-
-	if len(savedTabs) == 0 {
-		m.persistFreshTab(ctx, initialTabID, initialWorkingDir)
-		return
-	}
-
-	sessionStore := initialApp.SessionStore()
-	restoredFirst := false
-
-	for _, saved := range savedTabs {
-		// Validate the saved session still exists.
-		if sessionStore != nil && saved.SessionID != "" {
-			if _, err := sessionStore.GetSession(ctx, saved.SessionID); err != nil {
-				slog.Warn("Saved session no longer exists, removing stale tab",
-					"session_id", saved.SessionID, "error", err)
-				_ = ts.RemoveTab(ctx, saved.SessionID)
-				continue
-			}
-		}
-
-		// Determine the runtime tab ID to use.
-		var runtimeID string
-		if !restoredFirst {
-			restoredFirst = true
-			runtimeID = initialTabID
-		} else {
-			a, newSess, spawnCleanup, err := spawner(ctx, saved.WorkingDir)
-			if err != nil {
-				slog.Warn("Failed to restore tab", "working_dir", saved.WorkingDir, "error", err)
-				_ = ts.RemoveTab(ctx, saved.SessionID)
-				continue
-			}
-			runtimeID = sv.AddSession(ctx, a, newSess, saved.WorkingDir, spawnCleanup)
-		}
-
-		// Stash persisted session ID for lazy loading on first switch.
-		m.pendingRestores[runtimeID] = saved.SessionID
-		if saved.SidebarCollapsed {
-			m.pendingSidebarCollapsed[runtimeID] = true
-		}
-
-		// If this was the active tab, queue a switch on Init().
-		if saved.SessionID == savedActiveID {
-			if restoredFirst && runtimeID == initialTabID {
-				_ = ts.SetActiveTab(ctx, saved.SessionID)
-			} else {
-				m.pendingActiveTab = runtimeID
-			}
-		}
-
-		// Peek at the session title so the tab bar shows a name before lazy load.
-		if sessionStore != nil && saved.SessionID != "" {
-			if oldSess, err := sessionStore.GetSession(ctx, saved.SessionID); err == nil && oldSess.Title != "" {
-				sv.SetRunnerTitle(runtimeID, oldSess.Title)
-			}
-		}
-	}
-
-	// If all saved tabs were stale, persist the initial session.
-	if !restoredFirst {
-		m.persistFreshTab(ctx, initialTabID, initialWorkingDir)
-	}
 }
 
 // Init initializes the model.
@@ -421,6 +493,16 @@ func (m *appModel) Init() tea.Cmd {
 
 // Update handles messages.
 func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// In lean mode, silently drop messages for features that don't exist.
+	if m.leanMode {
+		switch msg.(type) {
+		case messages.SpawnSessionMsg, messages.SwitchTabMsg,
+			messages.CloseTabMsg, messages.ReorderTabMsg,
+			messages.ToggleSidebarMsg:
+			return m, nil
+		}
+	}
+
 	switch msg := msg.(type) {
 	// --- Routing & Animation ---
 
@@ -428,17 +510,21 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleRoutedMsg(msg)
 
 	case animation.TickMsg:
-		var cmds []tea.Cmd
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		cmds = append(cmds, cmd)
+		// Drop the tick (and let the chain die) while we're blurred.
+		// animation.StartTick re-arms the chain on the next FocusMsg so
+		// spinners resume immediately when the user comes back.
+		if m.tickPaused {
+			return m, nil
+		}
+		cmds := []tea.Cmd{m.updateChatCmd(msg)}
 		// Update working spinner
 		if m.chatPage.IsWorking() {
-			var model layout.Model
-			model, cmd = m.workingSpinner.Update(msg)
+			model, cmd := m.workingSpinner.Update(msg)
 			m.workingSpinner = model.(spinner.Spinner)
 			cmds = append(cmds, cmd)
 		}
+		// Track frame for window-title spinner (tmux activity detection)
+		m.animFrame = msg.Frame
 		// Forward frame to tab bar for running indicator animation
 		m.tabBar.SetAnimFrame(msg.Frame)
 		if animation.HasActive() {
@@ -529,16 +615,44 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := m.handleWindowResize(msg.Width, msg.Height)
 		return m, cmd
 
+	case tea.BlurMsg:
+		m.focused = false
+		m.tickPaused = true
+		return m, nil
+
+	case tea.FocusMsg:
+		// Filter spurious FocusMsg: RestoreTerminal re-enables focus
+		// reporting which delivers a FocusMsg even when we never blurred.
+		if m.focused {
+			return m, nil
+		}
+		m.focused = true
+
+		var cmds []tea.Cmd
+		if m.tickPaused {
+			// Re-arm the tick chain that died while we were blurred.
+			m.tickPaused = false
+			if animation.HasActive() {
+				cmds = append(cmds, animation.StartTick())
+			}
+		}
+		if m.dockerDesktop && m.program != nil {
+			// Docker Desktop: the terminal may have lost all mode state (alt
+			// screen, mouse tracking, keyboard enhancements, background
+			// color, etc.). A full release/restore cycle re-emits every mode
+			// sequence and forces a complete repaint.
+			cmds = append(cmds, func() tea.Msg {
+				_ = m.program.ReleaseTerminal()
+				_ = m.program.RestoreTerminal()
+				return nil
+			})
+		}
+		return m, tea.Batch(cmds...)
+
 	case tea.KeyboardEnhancementsMsg:
 		m.keyboardEnhancements = &msg
 		m.keyboardEnhancementsSupported = msg.Flags != 0
-		// Forward to content view
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		// Forward to editor
-		editorModel, editorCmd := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-		return m, tea.Batch(cmd, editorCmd)
+		return m, tea.Batch(m.updateChatCmd(msg), m.updateEditorCmd(msg))
 
 	// --- Keyboard input ---
 
@@ -547,14 +661,15 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		if m.dialogMgr.Open() {
-			u, cmd := m.dialogMgr.Update(msg)
-			m.dialogMgr = u.(dialog.Manager)
-			return m, cmd
+			return m.forwardDialog(msg)
+		}
+		// When inline editing a past message, forward paste to the chat page
+		// so the messages component can insert content into the inline textarea.
+		if m.chatPage.IsInlineEditing() {
+			return m.forwardChat(msg)
 		}
 		// Forward paste to editor
-		editorModel, cmd := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-		return m, cmd
+		return m.forwardEditor(msg)
 
 	// --- Mouse ---
 
@@ -573,9 +688,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// --- Dialog lifecycle ---
 
 	case dialog.OpenDialogMsg, dialog.CloseDialogMsg:
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		return m.forwardDialog(msg)
 
 	case dialog.ExitConfirmedMsg:
 		m.cleanupAll()
@@ -620,22 +733,16 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case *runtime.TeamInfoEvent:
 		m.sessionState.SetAvailableAgents(msg.AvailableAgents)
 		m.sessionState.SetCurrentAgentName(msg.CurrentAgent)
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	case *runtime.AgentInfoEvent:
 		m.sessionState.SetCurrentAgentName(msg.AgentName)
 		m.application.TrackCurrentAgentModel(msg.Model)
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	case *runtime.SessionTitleEvent:
 		m.sessionState.SetSessionTitle(msg.Title)
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	// --- New session (slash command /new) ---
 
@@ -643,9 +750,18 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// /new spawns a new tab when a session spawner is configured.
 		return m.handleSpawnSession("")
 
+	case messages.ClearSessionMsg:
+		// /clear resets the current tab with a fresh session in the same working dir.
+		return m.handleClearSession()
+
 	// --- Exit ---
 
 	case messages.ExitSessionMsg:
+		// If multiple tabs are open, close only the current tab instead of
+		// quitting the entire application (see #2373).
+		if m.supervisor != nil && m.supervisor.Count() > 1 {
+			return m.handleCloseTab(m.supervisor.ActiveID())
+		}
 		m.cleanupAll()
 		return m, tea.Quit
 
@@ -660,15 +776,16 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.history != nil {
 			_ = m.history.Add(msg.Content)
 		}
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	// --- File attachments (routed to editor) ---
 
 	case messages.InsertFileRefMsg:
-		m.editor.AttachFile(msg.FilePath)
-		return m, nil
+		if err := m.editor.AttachFile(msg.FilePath); err != nil {
+			slog.Warn("failed to attach file", "path", msg.FilePath, "error", err)
+			return m, nil
+		}
+		return m, notification.SuccessCmd("File attached: " + msg.FilePath)
 
 	// --- Agent management ---
 
@@ -686,16 +803,16 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.BranchFromEditMsg:
 		return m.handleBranchFromEdit(msg)
 
+	case messages.ForkSessionMsg:
+		return m.handleForkSession()
+
 	// --- Session commands (slash commands, command palette) ---
 
 	case messages.ToggleYoloMsg:
 		return m.handleToggleYolo()
 
-	case messages.ToggleThinkingMsg:
-		return m.handleToggleThinking()
-
-	case messages.ToggleThinkingResultMsg:
-		return m.handleToggleThinkingResult(msg)
+	case messages.TogglePauseMsg:
+		return m.handleTogglePause()
 
 	case messages.ToggleHideToolResultsMsg:
 		return m.handleToggleHideToolResults()
@@ -704,9 +821,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleToggleSplitDiff()
 
 	case messages.ClearQueueMsg:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	case messages.CompactSessionMsg:
 		return m.handleCompactSession(msg.AdditionalPrompt)
@@ -716,6 +831,15 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case messages.CopyLastResponseToClipboardMsg:
 		return m.handleCopyLastResponseToClipboard()
+
+	case messages.UndoSnapshotMsg:
+		return m.handleUndoSnapshot()
+
+	case messages.ShowSnapshotsDialogMsg:
+		return m.handleShowSnapshotsDialog()
+
+	case messages.ResetSnapshotMsg:
+		return m.handleResetSnapshot(msg.Keep)
 
 	case messages.EvalSessionMsg:
 		return m.handleEvalSession(msg.Filename)
@@ -734,6 +858,9 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.handleToggleSessionStar(sessionID)
 
+	case messages.DeleteSessionMsg:
+		return m.handleDeleteSession(msg.SessionID)
+
 	case messages.SetSessionTitleMsg:
 		return m.handleSetSessionTitle(msg.Title)
 
@@ -745,6 +872,12 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case messages.ShowPermissionsDialogMsg:
 		return m.handleShowPermissionsDialog()
+
+	case messages.ShowToolsDialogMsg:
+		return m.handleShowToolsDialog()
+
+	case messages.RestartToolsetMsg:
+		return m.handleRestartToolset(msg.Name)
 
 	case messages.AgentCommandMsg:
 		return m.handleAgentCommand(msg.Command)
@@ -783,10 +916,18 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// --- Speech-to-text ---
 
 	case messages.StartSpeakMsg:
-		return m, notification.InfoCmd("Speech-to-text is not yet supported")
+		if !m.transcriber.IsSupported() {
+			return m, notification.InfoCmd("Speech-to-text is only supported on macOS")
+		}
+		return m.handleStartSpeak()
 
-	case messages.StopSpeakMsg, messages.SpeakTranscriptMsg:
-		return m, nil
+	case messages.StopSpeakMsg:
+		return m.handleStopSpeak()
+
+	case messages.SpeakTranscriptMsg:
+		m.editor.InsertText(msg.Delta)
+		cmd := m.waitForTranscript()
+		return m, cmd
 
 	// --- MCP prompts ---
 
@@ -827,33 +968,16 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if agentName := event.GetAgentName(); agentName != "" {
 				m.sessionState.SetCurrentAgentName(agentName)
 			}
-			updated, cmd := m.chatPage.Update(msg)
-			m.chatPage = updated.(chat.Page)
-			return m, cmd
+			return m.forwardChat(msg)
 		}
 
-		// Forward to dialog if open
+		// Forward to dialog if open (and to chat in parallel)
 		if m.dialogMgr.Open() {
-			u, cmd := m.dialogMgr.Update(msg)
-			m.dialogMgr = u.(dialog.Manager)
-
-			updated, cmdChatPage := m.chatPage.Update(msg)
-			m.chatPage = updated.(chat.Page)
-
-			return m, tea.Batch(cmd, cmdChatPage)
+			return m, tea.Batch(m.updateDialogCmd(msg), m.updateChatCmd(msg))
 		}
 
-		// Forward to both completion manager and editor
-		updatedComp, cmdCompletions := m.completions.Update(msg)
-		m.completions = updatedComp.(completion.Manager)
-
-		editorModel, cmdEditor := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-
-		updated, cmdChatPage := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-
-		return m, tea.Batch(cmdCompletions, cmdEditor, cmdChatPage)
+		// Forward to completion manager, editor, and chat page in parallel
+		return m, tea.Batch(m.updateCompletionsCmd(msg), m.updateEditorCmd(msg), m.updateChatCmd(msg))
 	}
 }
 
@@ -962,11 +1086,11 @@ func (m *appModel) handleLoadSession(sessionID string) (tea.Model, tea.Cmd) {
 		// Update tuistate: replace old persisted ID with the loaded session's ID
 		if m.tuiStore != nil {
 			if err := m.tuiStore.UpdateTabSessionID(ctx, oldPersistedID, sess.ID); err != nil {
-				slog.Warn("Failed to update tab session ID after in-place load", "error", err)
+				slog.WarnContext(ctx, "Failed to update tab session ID after in-place load", "error", err)
 			}
 			if sess.WorkingDir != "" {
 				if err := m.tuiStore.UpdateTabWorkingDir(ctx, sess.ID, sess.WorkingDir); err != nil {
-					slog.Warn("Failed to update tab working dir after in-place load", "error", err)
+					slog.WarnContext(ctx, "Failed to update tab working dir after in-place load", "error", err)
 				}
 			}
 		}
@@ -974,7 +1098,7 @@ func (m *appModel) handleLoadSession(sessionID string) (tea.Model, tea.Cmd) {
 		return model, cmd
 	}
 
-	slog.Debug("Loading session into new tab", "session_id", sessionID)
+	slog.DebugContext(ctx, "Loading session into new tab", "session_id", sessionID)
 
 	// Spawn a new tab.
 	newSessionID, err := m.supervisor.SpawnSession(ctx, workingDir)
@@ -985,7 +1109,7 @@ func (m *appModel) handleLoadSession(sessionID string) (tea.Model, tea.Cmd) {
 	// Persist the new tab using the loaded session's persisted ID (not the ephemeral tab ID).
 	if m.tuiStore != nil {
 		if err := m.tuiStore.AddTab(ctx, sess.ID, workingDir); err != nil {
-			slog.Warn("Failed to persist loaded session tab", "error", err)
+			slog.WarnContext(ctx, "Failed to persist loaded session tab", "error", err)
 		}
 	}
 
@@ -1014,12 +1138,9 @@ func (m *appModel) handleLoadSession(sessionID string) (tea.Model, tea.Cmd) {
 func (m *appModel) replaceActiveSession(ctx context.Context, sess *session.Session) (tea.Model, tea.Cmd) {
 	activeID := m.supervisor.ActiveID()
 
-	slog.Debug("Replacing empty session in-place", "tab_id", activeID, "loaded_session", sess.ID)
+	slog.DebugContext(ctx, "Replacing empty session in-place", "tab_id", activeID, "loaded_session", sess.ID)
 
-	// Cleanup old chat page and editor for the active session
-	if cp, ok := m.chatPages[activeID]; ok {
-		cp.Cleanup()
-	}
+	// Cleanup old editor for the active session
 	if ed, ok := m.editors[activeID]; ok {
 		ed.Cleanup()
 	}
@@ -1031,14 +1152,14 @@ func (m *appModel) replaceActiveSession(ctx context.Context, sess *session.Sessi
 	if sessWorkingDir != "" && runner != nil && sessWorkingDir != runner.WorkingDir {
 		newApp, _, spawnCleanup, err := m.supervisor.Spawner()(ctx, sessWorkingDir)
 		if err == nil {
-			slog.Debug("Respawning runtime for working dir mismatch",
+			slog.DebugContext(ctx, "Respawning runtime for working dir mismatch",
 				"tab_id", activeID,
 				"old_dir", runner.WorkingDir,
 				"new_dir", sessWorkingDir)
 			m.supervisor.ReplaceRunnerApp(ctx, activeID, newApp, sessWorkingDir, spawnCleanup)
 			m.application = newApp
 		} else {
-			slog.Warn("Failed to respawn runtime for working dir, using existing",
+			slog.WarnContext(ctx, "Failed to respawn runtime for working dir, using existing",
 				"working_dir", sessWorkingDir, "error", err)
 		}
 	}
@@ -1053,6 +1174,46 @@ func (m *appModel) replaceActiveSession(ctx context.Context, sess *session.Sessi
 
 	cmd := m.initAndFocusComponents()
 	return m, cmd
+}
+
+// handleClearSession resets the current tab by creating a fresh session
+// in the same working directory.
+func (m *appModel) handleClearSession() (tea.Model, tea.Cmd) {
+	activeID := m.supervisor.ActiveID()
+
+	// Cleanup old editor for the active session.
+	if ed, ok := m.editors[activeID]; ok {
+		ed.Cleanup()
+	}
+
+	// Create a fresh session in the same app, preserving the working dir.
+	m.application.NewSession()
+	newSess := m.application.Session()
+
+	// Rebuild all per-session UI components.
+	m.initSessionComponents(activeID, m.application, newSess)
+	m.dialogMgr = dialog.New()
+	m.supervisor.SetRunnerTitle(activeID, "")
+	m.sessionState.SetSessionTitle("")
+	m.sessionState.SetPreviousMessage(nil)
+
+	// Update persisted tab to point to the new session.
+	if m.tuiStore != nil {
+		ctx := context.Background()
+		oldPersistedID := m.persistedSessionID(activeID)
+		if err := m.tuiStore.UpdateTabSessionID(ctx, oldPersistedID, newSess.ID); err != nil {
+			slog.WarnContext(ctx, "Failed to update tab session ID after clear", "error", err)
+		}
+	}
+	m.persistActiveTab(newSess.ID)
+
+	m.reapplyKeyboardEnhancements()
+
+	return m, tea.Sequence(
+		m.chatPage.Init(),
+		m.resizeAll(),
+		m.editor.Focus(),
+	)
 }
 
 // handleSpawnSession spawns a new session.
@@ -1072,7 +1233,7 @@ func (m *appModel) handleSpawnSession(workingDir string) (tea.Model, tea.Cmd) {
 	// Persist the new tab (for new tabs, persisted ID == runtime tab ID).
 	if m.tuiStore != nil {
 		if err := m.tuiStore.AddTab(ctx, sessionID, workingDir); err != nil {
-			slog.Warn("Failed to persist new tab", "error", err)
+			slog.WarnContext(ctx, "Failed to persist new tab", "error", err)
 		}
 	}
 
@@ -1100,13 +1261,58 @@ func (m *appModel) openWorkingDirPicker() (tea.Model, tea.Cmd) {
 	})
 }
 
+// stashedDialog holds a background dialog instance that was on screen when
+// the user navigated away from a tab, paired with the runtime event that
+// caused it to open. The event is used as an identity check on return: if
+// the supervisor's pending event for the tab no longer matches, the agent
+// has superseded the prompt and we discard the stash in favour of building
+// a fresh dialog from the new event.
+type stashedDialog struct {
+	dialog dialog.Dialog
+	event  tea.Msg
+}
+
 // handleSwitchTab switches to a different session.
 // Existing chat pages and editors are preserved (not recreated) so that in-flight streaming
 // content and draft text are retained when switching back to a tab.
 func (m *appModel) handleSwitchTab(sessionID string) (tea.Model, tea.Cmd) {
+	// If a background dialog (e.g. pending elicitation) is open on the
+	// outgoing tab, capture both its originating event and the live dialog
+	// instance before the supervisor flips activeID. We only commit the
+	// re-stash after SwitchTo succeeds — otherwise a failed switch would
+	// leave the supervisor with a stale pending event and the dialog still
+	// on screen.
+	//
+	// Stashing the dialog instance (rather than rebuilding it from the event
+	// on return) preserves any in-progress input the user typed — e.g. text
+	// already entered into a user_prompt elicitation. See issue #2770.
+	var (
+		backgroundEvent  tea.Msg
+		backgroundDialog dialog.Dialog
+		outgoingTabID    string
+	)
+	if m.dialogMgr.Open() && m.dialogMgr.TopIsBackground() {
+		backgroundEvent = m.dialogMgr.TopBackgroundEvent()
+		backgroundDialog = m.dialogMgr.TopDialog()
+		outgoingTabID = m.supervisor.ActiveID()
+	}
+
 	runner := m.supervisor.SwitchTo(sessionID)
 	if runner == nil {
 		return m, notification.ErrorCmd("Session not found")
+	}
+
+	// Now that the switch is committed, finalize the dialog hand-off.
+	var closeBackgroundDialogCmd tea.Cmd
+	if backgroundEvent != nil && outgoingTabID != "" && outgoingTabID != sessionID {
+		m.supervisor.SetPendingEvent(outgoingTabID, backgroundEvent)
+		if backgroundDialog != nil {
+			m.stashedDialogs[outgoingTabID] = stashedDialog{
+				dialog: backgroundDialog,
+				event:  backgroundEvent,
+			}
+		}
+		closeBackgroundDialogCmd = core.CmdHandler(dialog.CloseDialogMsg{})
 	}
 
 	// Blur current editor before switching
@@ -1128,7 +1334,7 @@ func (m *appModel) handleSwitchTab(sessionID string) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				cmd = tea.Batch(cmd, m.applySidebarCollapsed(sessionID))
+				cmd = tea.Batch(cmd, m.applySidebarCollapsed(sessionID), closeBackgroundDialogCmd)
 				return model, cmd
 			}
 		}
@@ -1179,6 +1385,9 @@ func (m *appModel) handleSwitchTab(sessionID string) (tea.Model, tea.Cmd) {
 	if pendingCmd := m.replayPendingEvent(sessionID); pendingCmd != nil {
 		cmds = append(cmds, pendingCmd)
 	}
+	if closeBackgroundDialogCmd != nil {
+		cmds = append(cmds, closeBackgroundDialogCmd)
+	}
 
 	return m, tea.Batch(cmds...)
 }
@@ -1199,26 +1408,49 @@ func (m *appModel) applySidebarCollapsed(sessionID string) tea.Cmd {
 // max iterations, elicitation) that was received while the tab was inactive.
 // If found, it opens the appropriate dialog. The event was already processed by the chat page
 // (updating the message list), but the dialog command was discarded for inactive sessions.
+//
+// If a stashed dialog instance is available for this session and its
+// associated event still matches the pending one, the same instance is
+// re-opened so any in-progress input survives the round trip (issue #2770).
+// Otherwise the stash is discarded and a fresh dialog is built.
 func (m *appModel) replayPendingEvent(sessionID string) tea.Cmd {
 	pendingEvent := m.supervisor.ConsumePendingEvent(sessionID)
 	if pendingEvent == nil {
+		// No pending event: any stash is stale (e.g. the agent finished).
+		delete(m.stashedDialogs, sessionID)
 		return nil
 	}
 
 	sessionState, ok := m.sessionStates[sessionID]
 	if !ok {
+		delete(m.stashedDialogs, sessionID)
 		return nil
+	}
+
+	// If we stashed the live dialog instance when leaving this tab and the
+	// pending event hasn't changed, re-open the same instance so the user's
+	// in-progress input is preserved.
+	if stash, ok := m.stashedDialogs[sessionID]; ok {
+		delete(m.stashedDialogs, sessionID)
+		if stash.event == pendingEvent && stash.dialog != nil {
+			return core.CmdHandler(dialog.OpenDialogMsg{
+				Model:            stash.dialog,
+				OriginatingEvent: pendingEvent,
+			})
+		}
 	}
 
 	switch ev := pendingEvent.(type) {
 	case *runtime.ToolCallConfirmationEvent:
 		return core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewToolConfirmationDialog(ev, sessionState),
+			Model:            dialog.NewToolConfirmationDialog(ev, sessionState),
+			OriginatingEvent: ev,
 		})
 
 	case *runtime.MaxIterationsReachedEvent:
 		return core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewMaxIterationsDialog(ev.MaxIterations, m.application),
+			Model:            dialog.NewMaxIterationsDialog(ev.MaxIterations, m.application),
+			OriginatingEvent: ev,
 		})
 
 	case *runtime.ElicitationRequestEvent:
@@ -1238,7 +1470,8 @@ func (m *appModel) replayElicitationEvent(ev *runtime.ElicitationRequestEvent) t
 				serverURL = url
 			}
 			return core.CmdHandler(dialog.OpenDialogMsg{
-				Model: dialog.NewOAuthAuthorizationDialog(serverURL, m.application),
+				Model:            dialog.NewOAuthAuthorizationDialog(serverURL, m.application),
+				OriginatingEvent: ev,
 			})
 		}
 	}
@@ -1246,11 +1479,13 @@ func (m *appModel) replayElicitationEvent(ev *runtime.ElicitationRequestEvent) t
 	switch ev.Mode {
 	case "url":
 		return core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewURLElicitationDialog(ev.Message, ev.URL),
+			Model:            dialog.NewURLElicitationDialog(ev.Message, ev.URL),
+			OriginatingEvent: ev,
 		})
 	default:
 		return core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewElicitationDialog(ev.Message, ev.Schema, ev.Meta),
+			Model:            dialog.NewElicitationDialog(ev.Message, ev.Schema, ev.Meta),
+			OriginatingEvent: ev,
 		})
 	}
 }
@@ -1289,10 +1524,7 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	nextActiveID := m.supervisor.CloseSession(sessionID)
 
 	// Clean up per-session state
-	if cp, ok := m.chatPages[sessionID]; ok {
-		cp.Cleanup()
-		delete(m.chatPages, sessionID)
-	}
+	delete(m.chatPages, sessionID)
 	if ed, ok := m.editors[sessionID]; ok {
 		ed.Cleanup()
 		delete(m.editors, sessionID)
@@ -1300,6 +1532,7 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	delete(m.sessionStates, sessionID)
 	delete(m.pendingRestores, sessionID)
 	delete(m.pendingSidebarCollapsed, sessionID)
+	delete(m.stashedDialogs, sessionID)
 
 	var cmds []tea.Cmd
 	// Remove from persistent store using the persisted session-store ID.
@@ -1307,7 +1540,7 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		if err := m.tuiStore.RemoveTab(ctx, persistedID); err != nil {
-			slog.Error("Failed to remove tab from store", "error", err)
+			slog.ErrorContext(ctx, "Failed to remove tab from store", "error", err)
 			cmds = append(cmds, notification.ErrorCmd(fmt.Sprintf("Failed to remove tab from tui state db: %v", err)))
 		}
 	}
@@ -1356,14 +1589,19 @@ func (m *appModel) resizeAll() tea.Cmd {
 	var cmds []tea.Cmd
 
 	width, height := m.width, m.height
+	innerWidth := width - appPaddingHorizontal
 
-	// Calculate fixed heights
-	tabBarHeight := m.tabBar.Height()
-	statusBarHeight := m.statusBar.Height()
-	resizeHandleHeight := 1
+	// Calculate chrome height (everything that isn't content or editor)
+	chromeHeight := 0
+	if m.leanMode {
+		if m.chatPage.IsWorking() {
+			chromeHeight = 1 // working indicator line
+		}
+	} else {
+		chromeHeight = m.tabBar.Height() + m.statusBar.Height() + 1 // +1 for resize handle
+	}
 
 	// Calculate editor height
-	innerWidth := width - appPaddingHorizontal
 	minLines := 4
 	maxLines := max(minLines, (height-6)/2)
 	m.editorLines = max(minLines, min(m.editorLines, maxLines))
@@ -1376,22 +1614,19 @@ func (m *appModel) resizeAll() tea.Cmd {
 	editorRenderedHeight := editorHeight + 1
 
 	// Content gets remaining space
-	m.contentHeight = max(1, height-tabBarHeight-statusBarHeight-resizeHandleHeight-editorRenderedHeight)
+	m.contentHeight = max(1, height-chromeHeight-editorRenderedHeight)
+	cmds = append(cmds, m.chatPage.SetSize(width, m.contentHeight))
 
-	// Update dialog (uses full window dimensions for overlay positioning)
-	u, cmd := m.dialogMgr.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	m.dialogMgr = u.(dialog.Manager)
-	cmds = append(cmds, cmd)
+	if m.leanMode {
+		return tea.Batch(cmds...)
+	}
 
-	// Update chat page (content area)
-	cmd = m.chatPage.SetSize(width, m.contentHeight)
-	cmds = append(cmds, cmd)
+	// Full mode: update overlay components
+	cmds = append(cmds, m.updateDialogCmd(tea.WindowSizeMsg{Width: width, Height: height}))
 
-	// Update completion manager with editor height for popup positioning
-	m.completions.SetEditorBottom(editorHeight + tabBarHeight)
+	m.completions.SetEditorBottom(editorHeight + m.tabBar.Height())
 	m.completions.Update(tea.WindowSizeMsg{Width: width, Height: height})
 
-	// Update notification
 	m.notification.SetSize(width, height)
 
 	return tea.Batch(cmds...)
@@ -1402,12 +1637,17 @@ func (m *appModel) Help() help.KeyMap {
 	return core.NewSimpleHelp(m.Bindings())
 }
 
-// Bindings returns the key bindings shown in the status bar.
-func (m *appModel) Bindings() []key.Binding {
+// AllBindings returns ALL available key bindings for the help dialog (comprehensive list).
+func (m *appModel) AllBindings() []key.Binding {
 	quitBinding := key.NewBinding(
 		key.WithKeys("ctrl+c"),
 		key.WithHelp("Ctrl+c", "quit"),
 	)
+
+	if m.leanMode {
+		return []key.Binding{quitBinding}
+	}
+
 	tabBinding := key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("Tab", "switch focus"),
@@ -1416,10 +1656,48 @@ func (m *appModel) Bindings() []key.Binding {
 	bindings := []key.Binding{quitBinding, tabBinding}
 	bindings = append(bindings, m.tabBar.Bindings()...)
 
-	bindings = append(bindings, key.NewBinding(
-		key.WithKeys("ctrl+k"),
-		key.WithHelp("Ctrl+k", "commands"),
-	))
+	// Additional global shortcuts
+	bindings = append(bindings,
+		key.NewBinding(
+			key.WithKeys("ctrl+k"),
+			key.WithHelp("Ctrl+k", "commands"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+h"),
+			key.WithHelp("Ctrl+h", "help"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+y"),
+			key.WithHelp("Ctrl+y", "toggle yolo mode"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+o"),
+			key.WithHelp("Ctrl+o", "toggle hide tool results"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+s"),
+			key.WithHelp("Ctrl+s", "cycle agent"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+m"),
+			key.WithHelp("Ctrl+m", "model picker"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("Ctrl+x", "clear queue"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+z"),
+			key.WithHelp("Ctrl+z", "suspend"),
+		),
+	)
+
+	if !m.leanMode {
+		bindings = append(bindings, key.NewBinding(
+			key.WithKeys("ctrl+b"),
+			key.WithHelp("Ctrl+b", "toggle sidebar"),
+		))
+	}
 
 	// Show newline help based on keyboard enhancement support
 	if m.keyboardEnhancementsSupported {
@@ -1437,11 +1715,11 @@ func (m *appModel) Bindings() []key.Binding {
 	if m.focusedPanel == PanelContent {
 		bindings = append(bindings, m.chatPage.Bindings()...)
 	} else {
-		editorName := getEditorDisplayNameFromEnv(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
+		editorName := editorname.FromEnv(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
 		bindings = append(bindings,
 			key.NewBinding(
 				key.WithKeys("ctrl+g"),
-				key.WithHelp("Ctrl+g", fmt.Sprintf("edit in %s", editorName)),
+				key.WithHelp("Ctrl+g", "edit in "+editorName),
 			),
 			key.NewBinding(
 				key.WithKeys("ctrl+r"),
@@ -1452,18 +1730,98 @@ func (m *appModel) Bindings() []key.Binding {
 	return bindings
 }
 
+// Bindings returns the key bindings shown in the status bar (a curated subset).
+// This filters AllBindings() to show only the most essential commands.
+func (m *appModel) Bindings() []key.Binding {
+	all := m.AllBindings()
+
+	// Define which keys should appear in the status bar
+	statusBarKeys := map[string]bool{
+		"ctrl+c":      true, // quit
+		"tab":         true, // switch focus
+		"ctrl+t":      true, // new tab (from tabBar)
+		"ctrl+w":      true, // close tab (from tabBar)
+		"ctrl+p":      true, // prev tab (from tabBar)
+		"ctrl+n":      true, // next tab (from tabBar)
+		"ctrl+k":      true, // commands
+		"ctrl+h":      true, // help
+		"shift+enter": true, // newline
+		"ctrl+j":      true, // newline fallback
+		"ctrl+g":      true, // edit in external editor (editor context)
+		"ctrl+r":      true, // history search (editor context)
+		// Content panel bindings (↑↓, c, e, d) are always included
+		"up":   true,
+		"down": true,
+		"c":    true,
+		"e":    true,
+		"d":    true,
+	}
+
+	// Filter to only include status bar keys
+	var filtered []key.Binding
+	for _, binding := range all {
+		if len(binding.Keys()) > 0 {
+			bindingKey := binding.Keys()[0]
+			if statusBarKeys[bindingKey] {
+				filtered = append(filtered, binding)
+			}
+		}
+	}
+
+	return filtered
+}
+
 // handleKeyPress handles all keyboard input with proper priority routing.
 func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// Dialog gets priority when open
+	// Check if we should stop transcription on Enter or Escape
+	if m.transcriber.IsRunning() {
+		switch msg.String() {
+		case "enter":
+			model, cmd := m.handleStopSpeak()
+			sendCmd := m.editor.SendContent()
+			return model, tea.Batch(cmd, sendCmd)
+
+		case "esc":
+			return m.handleStopSpeak()
+		}
+	}
+
+	// Ctrl+c is intercepted before any dialog handling so that every dialog
+	// reacts to it consistently:
+	//   - With no dialog open: open the exit confirmation dialog.
+	//   - With any other dialog open: stack the exit confirmation on top so
+	//     that the user can confirm exit (a second ctrl+c or Y exits) or
+	//     cancel it (N/Esc) and return to the original dialog.
+	//   - With the exit confirmation already on top: forward the key so it
+	//     can exit the program via its own Yes binding.
+	if msg.String() == "ctrl+c" {
+		if m.dialogMgr.TopIsExitConfirmation() {
+			return m.forwardDialog(msg)
+		}
+		return m, core.CmdHandler(dialog.OpenDialogMsg{
+			Model: dialog.NewExitConfirmationDialog(),
+		})
+	}
+
+	// Dialog gets priority when open, EXCEPT for background dialogs (e.g.
+	// pending elicitations) which let tab-navigation keys keep working so
+	// the user can switch to another conversation while the prompt waits.
 	if m.dialogMgr.Open() {
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		if m.dialogMgr.TopIsBackground() && !m.leanMode && !m.editor.IsHistorySearchActive() {
+			m.tabBar.SetCloseTabEnabled(true)
+			if cmd := m.tabBar.Update(msg); cmd != nil {
+				return m, cmd
+			}
+		}
+		return m.forwardDialog(msg)
 	}
 
 	// Tab bar keys (Ctrl+t, Ctrl+p, Ctrl+n, Ctrl+w) are suppressed during
 	// history search so that ctrl+n/ctrl+p cycle through matches instead.
-	if !m.editor.IsHistorySearchActive() {
+	// Ctrl+w (close tab) is disabled when the editor is focused so that the
+	// standard "delete word" shortcut works while typing.
+	if !m.leanMode && !m.editor.IsHistorySearchActive() {
+		m.tabBar.SetCloseTabEnabled(m.focusedPanel != PanelEditor)
 		if cmd := m.tabBar.Update(msg); cmd != nil {
 			return m, cmd
 		}
@@ -1472,34 +1830,19 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Completion popup gets priority when open
 	if m.completions.Open() {
 		if core.IsNavigationKey(msg) {
-			u, cmd := m.completions.Update(msg)
-			m.completions = u.(completion.Manager)
-			return m, cmd
+			return m.forwardCompletions(msg)
 		}
 		// For all other keys (typing), send to both completion (for filtering) and editor
-		var cmds []tea.Cmd
-		u, completionCmd := m.completions.Update(msg)
-		m.completions = u.(completion.Manager)
-		cmds = append(cmds, completionCmd)
-
-		editorModel, cmd := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-		cmds = append(cmds, cmd)
-		return m, tea.Batch(cmds...)
+		return m, tea.Batch(m.updateCompletionsCmd(msg), m.updateEditorCmd(msg))
 	}
 
 	// Global keyboard shortcuts (active even during history search)
 	switch {
-	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+c"))):
-		return m, core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewExitConfirmationDialog(),
-		})
-
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+z"))):
 		return m, tea.Suspend
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+k"))):
-		categories := commands.BuildCommandCategories(context.Background(), m.application)
+		categories := m.commandCategories()
 		return m, core.CmdHandler(dialog.OpenDialogMsg{
 			Model: dialog.NewCommandPaletteDialog(categories),
 		})
@@ -1518,13 +1861,17 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+x"))):
 		return m, core.CmdHandler(messages.ClearQueueMsg{})
+
+	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+h", "f1", "ctrl+?"))):
+		// Show contextual help dialog with ALL available key bindings
+		return m, core.CmdHandler(dialog.OpenDialogMsg{
+			Model: dialog.NewHelpDialog(m.AllBindings()),
+		})
 	}
 
 	// History search is a modal state — capture all remaining keys before normal routing
 	if m.focusedPanel == PanelEditor && m.editor.IsHistorySearchActive() {
-		editorModel, cmd := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-		return m, cmd
+		return m.forwardEditor(msg)
 	}
 
 	switch {
@@ -1540,9 +1887,10 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// Toggle sidebar (propagates to content view regardless of focus)
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+b"))):
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		if m.leanMode {
+			return m, nil
+		}
+		return m.forwardChat(msg)
 
 	// Focus switching: Tab key toggles between content and editor
 	case key.Matches(msg, key.NewBinding(key.WithKeys("tab"))):
@@ -1551,9 +1899,7 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Esc: cancel stream (works regardless of focus)
 	case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
 		// Forward to content view for stream cancellation
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	default:
 		// Handle ctrl+1 through ctrl+9 for quick agent switching
@@ -1565,13 +1911,9 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Focus-based routing
 	switch m.focusedPanel {
 	case PanelEditor:
-		editorModel, cmd := m.editor.Update(msg)
-		m.editor = editorModel.(editor.Editor)
-		return m, cmd
+		return m.forwardEditor(msg)
 	case PanelContent:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 	}
 
 	return m, nil
@@ -1609,20 +1951,32 @@ func (m *appModel) switchFocus() (tea.Model, tea.Cmd) {
 
 // handleMouseClick routes mouse clicks to the appropriate component based on Y coordinate.
 func (m *appModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	// Check if click hits a notification close button
+	if cmd := m.notification.HandleClick(msg.X, msg.Y); cmd != nil {
+		return m, cmd
+	}
+
 	// Dialogs use full-window coordinates (they're positioned over the entire screen)
 	if m.dialogMgr.Open() {
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		// Background dialogs (e.g. pending elicitations) let tab-bar clicks
+		// pass through so the user can keep navigating between tabs.
+		if m.dialogMgr.TopIsBackground() && !m.leanMode && m.hitTestRegion(msg.Y) == regionTabBar {
+			adjustedMsg := msg
+			adjustedMsg.X = msg.X - styles.AppPadding
+			adjustedMsg.Y = msg.Y - m.contentHeight - 1
+			if cmd := m.tabBar.Update(adjustedMsg); cmd != nil {
+				return m, cmd
+			}
+			return m, nil
+		}
+		return m.forwardDialog(msg)
 	}
 
 	region := m.hitTestRegion(msg.Y)
 
 	switch region {
 	case regionContent:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 
 	case regionResizeHandle:
 		if msg.Button == tea.MouseLeft {
@@ -1651,9 +2005,7 @@ func (m *appModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) 
 		adjustedMsg := msg
 		adjustedMsg.X = msg.X - styles.AppPadding
 		adjustedMsg.Y = msg.Y - m.editorTop()
-		editorModel, cmd := m.editor.Update(adjustedMsg)
-		m.editor = editorModel.(editor.Editor)
-		return m, tea.Batch(cmd, m.editor.Focus())
+		return m, tea.Batch(m.updateEditorCmd(adjustedMsg), m.editor.Focus())
 
 	case regionStatusBar:
 		if msg.Button == tea.MouseLeft && m.statusBar.ClickedNewTab(msg.X) {
@@ -1680,9 +2032,7 @@ func (m *appModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd
 	}
 
 	if m.dialogMgr.Open() {
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		return m.forwardDialog(msg)
 	}
 
 	// Update hover state for resize handle
@@ -1690,16 +2040,12 @@ func (m *appModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd
 	m.isHoveringHandle = region == regionResizeHandle
 	switch region {
 	case regionContent:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 	case regionEditor:
 		adjustedMsg := msg
 		adjustedMsg.X = msg.X - styles.AppPadding
 		adjustedMsg.Y = msg.Y - m.editorTop()
-		editorModel, cmd := m.editor.Update(adjustedMsg)
-		m.editor = editorModel.(editor.Editor)
-		return m, cmd
+		return m.forwardEditor(adjustedMsg)
 	}
 
 	return m, nil
@@ -1723,24 +2069,18 @@ func (m *appModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.C
 	}
 
 	if m.dialogMgr.Open() {
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		return m.forwardDialog(msg)
 	}
 
 	region := m.hitTestRegion(msg.Y)
 	switch region {
 	case regionContent:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 	case regionEditor:
 		adjustedMsg := msg
 		adjustedMsg.X = msg.X - styles.AppPadding
 		adjustedMsg.Y = msg.Y - m.editorTop()
-		editorModel, cmd := m.editor.Update(adjustedMsg)
-		m.editor = editorModel.(editor.Editor)
-		return m, cmd
+		return m.forwardEditor(adjustedMsg)
 	}
 
 	return m, nil
@@ -1753,17 +2093,13 @@ func (m *appModel) handleWheelCoalesced(msg messages.WheelCoalescedMsg) (tea.Mod
 	}
 
 	if m.dialogMgr.Open() {
-		u, cmd := m.dialogMgr.Update(msg)
-		m.dialogMgr = u.(dialog.Manager)
-		return m, cmd
+		return m.forwardDialog(msg)
 	}
 
 	region := m.hitTestRegion(msg.Y)
 	switch region {
 	case regionContent:
-		updated, cmd := m.chatPage.Update(msg)
-		m.chatPage = updated.(chat.Page)
-		return m, cmd
+		return m.forwardChat(msg)
 	case regionEditor:
 		m.editor.ScrollByWheel(msg.Delta)
 		return m, nil
@@ -1785,9 +2121,28 @@ const (
 
 // hitTestRegion determines which layout region a Y coordinate falls in.
 func (m *appModel) hitTestRegion(y int) layoutRegion {
-	tabBarHeight := m.tabBar.Height()
+	if m.leanMode {
+		return hitTestLeanRegion(y, m.contentHeight)
+	}
+	_, editorHeight := m.editor.GetSize()
+	return hitTestFullRegion(y, m.contentHeight, m.tabBar.Height(), editorHeight)
+}
 
-	resizeHandleTop := m.contentHeight
+// hitTestLeanRegion is the pure layout calculation used in lean mode where
+// the screen is split between content and editor only.
+func hitTestLeanRegion(y, contentHeight int) layoutRegion {
+	if y < contentHeight {
+		return regionContent
+	}
+	return regionEditor
+}
+
+// hitTestFullRegion is the pure layout calculation used in full mode where the
+// screen is content | resize handle | [tab bar] | editor | status bar.
+// It is exported as a free function (rather than a method) so that it can be
+// unit-tested without constructing a full appModel.
+func hitTestFullRegion(y, contentHeight, tabBarHeight, editorHeight int) layoutRegion {
+	resizeHandleTop := contentHeight
 	tabBarTop := resizeHandleTop + 1
 	editorTop := tabBarTop + tabBarHeight
 
@@ -1799,7 +2154,6 @@ func (m *appModel) hitTestRegion(y int) layoutRegion {
 	case y < editorTop:
 		return regionTabBar
 	default:
-		_, editorHeight := m.editor.GetSize()
 		if y < editorTop+editorHeight {
 			return regionEditor
 		}
@@ -1825,6 +2179,17 @@ func (m *appModel) handleEditorResize(y int) tea.Cmd {
 		return m.resizeAll()
 	}
 	return nil
+}
+
+// renderLeanWorkingIndicator renders a single-line working indicator for lean mode.
+func (m *appModel) renderLeanWorkingIndicator() string {
+	innerWidth := m.width - appPaddingHorizontal
+	workingText := "Working\u2026"
+	if queueLen := m.chatPage.QueueLength(); queueLen > 0 {
+		workingText = fmt.Sprintf("Working\u2026 (%d queued)", queueLen)
+	}
+	line := m.workingSpinner.View() + " " + styles.SpinnerDotsHighlightStyle.Render(workingText)
+	return lipgloss.NewStyle().Padding(0, styles.AppPadding).Width(innerWidth + appPaddingHorizontal).Render(line)
 }
 
 // renderResizeHandle renders the draggable separator between content and bottom panel.
@@ -1884,7 +2249,7 @@ func (m *appModel) View() tea.View {
 	windowTitle := m.windowTitle()
 
 	if m.err != nil {
-		return toFullscreenView(styles.ErrorStyle.Render(m.err.Error()), windowTitle)
+		return toFullscreenView(styles.ErrorStyle.Render(m.err.Error()), windowTitle, false, m.leanMode)
 	}
 
 	if !m.ready {
@@ -1894,11 +2259,26 @@ func (m *appModel) View() tea.View {
 				Height(m.wHeight).
 				Render(styles.MutedStyle.Render("Loading…")),
 			windowTitle,
+			false,
+			m.leanMode,
 		)
 	}
 
 	// Content area (messages + sidebar) -- swaps per tab
 	contentView := m.chatPage.View()
+
+	// Lean mode: editor appears right after the last message, with empty
+	// space pushed to the top via bottom-alignment.
+	if m.leanMode {
+		viewParts := []string{contentView}
+		if m.chatPage.IsWorking() {
+			viewParts = append(viewParts, m.renderLeanWorkingIndicator())
+		}
+		viewParts = append(viewParts, m.editor.View())
+		inner := lipgloss.JoinVertical(lipgloss.Top, viewParts...)
+		baseView := lipgloss.PlaceVertical(m.height, lipgloss.Bottom, inner)
+		return toFullscreenView(baseView, windowTitle, m.chatPage.IsWorking(), m.leanMode)
+	}
 
 	// Resize handle (between content and bottom panel)
 	resizeHandle := m.renderResizeHandle(m.width)
@@ -1949,71 +2329,60 @@ func (m *appModel) View() tea.View {
 			allLayers = append(allLayers, m.completions.GetLayers()...)
 		}
 
-		canvas := lipgloss.NewCanvas(allLayers...)
-		return toFullscreenView(canvas.Render(), windowTitle)
+		compositor := lipgloss.NewCompositor(allLayers...)
+		return toFullscreenView(compositor.Render(), windowTitle, m.chatPage.IsWorking(), m.leanMode)
 	}
 
-	return toFullscreenView(baseView, windowTitle)
+	return toFullscreenView(baseView, windowTitle, m.chatPage.IsWorking(), m.leanMode)
 }
 
-// windowTitle returns the terminal window title.
+// windowTitle returns the terminal window title for the current model state.
+// When the agent is working, a rotating spinner character is prepended so that
+// terminal multiplexers (tmux) can detect activity in the pane.
 func (m *appModel) windowTitle() string {
-	if sessionTitle := m.sessionState.SessionTitle(); sessionTitle != "" {
-		return sessionTitle + " - cagent"
-	}
-	return "cagent"
+	return formatWindowTitle(m.appName, m.sessionState.SessionTitle(), m.chatPage.IsWorking(), m.animFrame)
 }
+
+// formatWindowTitle assembles the terminal window title string from the
+// individual inputs that contribute to it. Pure function — extracted from the
+// windowTitle method so that it can be unit-tested without constructing a
+// full appModel.
+func formatWindowTitle(appName, sessionTitle string, working bool, animFrame int) string {
+	title := appName
+	if sessionTitle != "" {
+		title = sessionTitle + " - " + appName
+	}
+	if working {
+		title = spinner.Frame(animFrame) + " " + title
+	}
+	return title
+}
+
+// exitFunc is the function called by the shutdown safety net when the
+// graceful exit times out. It defaults to os.Exit but can be replaced
+// in tests.
+var exitFunc = os.Exit
+
+var shutdownTimeout = 5 * time.Second
 
 // cleanupAll cleans up all sessions, editors, and resources.
 func (m *appModel) cleanupAll() {
-	if m.cancelThinkingCheck != nil {
-		m.cancelThinkingCheck()
-		m.cancelThinkingCheck = nil
-	}
-	for _, cp := range m.chatPages {
-		cp.Cleanup()
-	}
+	m.transcriber.Stop()
+	m.closeTranscriptCh()
 	for _, ed := range m.editors {
 		ed.Cleanup()
 	}
-}
 
-// persistedSessionID returns the session-store ID that should be used for
-// tuistate persistence for the given runtime tab ID.
-//
-// If the tab has a pending restore (session not yet lazily loaded), the
-// persisted ID from pendingRestores is returned — this is the original
-// session-store ID that was saved across restarts. Otherwise the live
-// session ID from the app is used.
-func (m *appModel) persistedSessionID(tabID string) string {
-	if persistedID, ok := m.pendingRestores[tabID]; ok {
-		return persistedID
-	}
-	if runner := m.supervisor.GetRunner(tabID); runner != nil {
-		return runner.App.Session().ID
-	}
-	return tabID
-}
-
-// findTabByPersistedID scans all open tabs and returns the runtime tab ID
-// whose persisted session-store ID matches the given ID. Returns "" if not found.
-func (m *appModel) findTabByPersistedID(persistedID string) string {
-	// Check pending restores first (tabs not yet lazily loaded).
-	for tabID, pid := range m.pendingRestores {
-		if pid == persistedID {
-			return tabID
-		}
-	}
-	// Check live sessions.
-	tabs, _ := m.supervisor.GetTabs()
-	for _, tab := range tabs {
-		if runner := m.supervisor.GetRunner(tab.SessionID); runner != nil {
-			if runner.App.Session().ID == persistedID {
-				return tab.SessionID
-			}
-		}
-	}
-	return ""
+	// Safety net: force-exit if bubbletea's shutdown gets stuck.
+	// This can happen when the renderer's flush goroutine blocks on a
+	// stdout write (terminal buffer full) while holding the renderer
+	// mutex, preventing the event loop from completing the render call
+	// that follows tea.Quit.
+	go func() {
+		time.Sleep(shutdownTimeout)
+		slog.Warn("Graceful shutdown timed out, forcing exit")
+		exitFunc(0)
+	}()
 }
 
 // openExternalEditor opens the current editor content in an external editor.
@@ -2028,11 +2397,11 @@ func (m *appModel) openExternalEditor() (tea.Model, tea.Cmd) {
 	tmpPath := tmpFile.Name()
 
 	if _, err := tmpFile.WriteString(content); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return m, notification.ErrorCmd(fmt.Sprintf("Failed to write temp file: %v", err))
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	// Get the editor command (VISUAL, EDITOR, or platform default)
 	editorCmd := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
@@ -2047,7 +2416,8 @@ func (m *appModel) openExternalEditor() (tea.Model, tea.Cmd) {
 	// Parse editor command (may include arguments like "code --wait")
 	parts := strings.Fields(editorCmd)
 	args := append(parts[1:], tmpPath)
-	cmd := exec.Command(parts[0], args...)
+	// External editor is owned by tea.ExecProcess, so exec.Command is intentional.
+	cmd := exec.Command(parts[0], args...) //nolint:noctx // owned by tea.ExecProcess
 
 	ed := m.editor
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
@@ -2076,64 +2446,14 @@ func (m *appModel) openExternalEditor() (tea.Model, tea.Cmd) {
 	})
 }
 
-// getEditorDisplayNameFromEnv returns a friendly display name for the configured editor.
-func getEditorDisplayNameFromEnv(visual, editorEnv string) string {
-	editorCmd := cmp.Or(visual, editorEnv)
-	if editorCmd == "" {
-		if goruntime.GOOS == "windows" {
-			return "Notepad"
-		}
-		return "Vi"
-	}
-
-	parts := strings.Fields(editorCmd)
-	if len(parts) == 0 {
-		return "$EDITOR"
-	}
-
-	baseName := filepath.Base(parts[0])
-
-	editorPrefixes := []struct {
-		prefix string
-		name   string
-	}{
-		{"code", "VSCode"},
-		{"cursor", "Cursor"},
-		{"nvim", "Neovim"},
-		{"vim", "Vim"},
-		{"vi", "Vi"},
-		{"nano", "Nano"},
-		{"emacs", "Emacs"},
-		{"subl", "Sublime Text"},
-		{"sublime", "Sublime Text"},
-		{"atom", "Atom"},
-		{"gedit", "gedit"},
-		{"kate", "Kate"},
-		{"notepad++", "Notepad++"},
-		{"notepad", "Notepad"},
-		{"textmate", "TextMate"},
-		{"mate", "TextMate"},
-		{"zed", "Zed"},
-	}
-
-	for _, e := range editorPrefixes {
-		if strings.HasPrefix(baseName, e.prefix) {
-			return e.name
-		}
-	}
-
-	if baseName != "" {
-		return strings.ToUpper(baseName[:1]) + baseName[1:]
-	}
-
-	return "$EDITOR"
-}
-
-func toFullscreenView(content, windowTitle string) tea.View {
+func toFullscreenView(content, windowTitle string, working, leanMode bool) tea.View {
 	view := tea.NewView(content)
-	view.AltScreen = true
-	view.MouseMode = tea.MouseModeCellMotion
+	view.AltScreen = !leanMode
+	view.MouseMode = tea.MouseModeAllMotion
 	view.BackgroundColor = styles.Background
 	view.WindowTitle = windowTitle
+	if working {
+		view.ProgressBar = tea.NewProgressBar(tea.ProgressBarIndeterminate, 0)
+	}
 	return view
 }

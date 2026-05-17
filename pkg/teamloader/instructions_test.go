@@ -5,11 +5,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 type toolSet struct {
 	tools.ToolSet
+
 	instruction string
 }
 

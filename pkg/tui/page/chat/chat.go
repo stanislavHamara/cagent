@@ -1,31 +1,28 @@
 package chat
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	goruntime "runtime"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/app"
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/tui/commands"
-	"github.com/docker/cagent/pkg/tui/components/messages"
-	"github.com/docker/cagent/pkg/tui/components/notification"
-	"github.com/docker/cagent/pkg/tui/components/sidebar"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/core/layout"
-	msgtypes "github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/app"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/tui/commands"
+	"github.com/docker/docker-agent/pkg/tui/components/messages"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/sidebar"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	msgtypes "github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/service"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 const (
@@ -95,7 +92,6 @@ type Page interface {
 	layout.Sizeable
 	layout.Help
 	CompactSession(additionalPrompt string) tea.Cmd
-	Cleanup()
 	// SetSessionStarred updates the sidebar star indicator
 	SetSessionStarred(starred bool)
 	// SetTitleRegenerating sets the title regenerating state on the sidebar
@@ -104,6 +100,8 @@ type Page interface {
 	ScrollToBottom() tea.Cmd
 	// IsWorking returns whether the agent is currently working
 	IsWorking() bool
+	// IsInlineEditing returns true if a past user message is being edited inline
+	IsInlineEditing() bool
 	// QueueLength returns the number of queued messages
 	QueueLength() int
 	// FocusMessages gives focus to the messages panel for keyboard scrolling
@@ -138,10 +136,13 @@ type chatPage struct {
 	sessionState *service.SessionState
 
 	// State
-	working bool
+	working  bool
+	leanMode bool
 
 	msgCancel       context.CancelFunc
 	streamCancelled bool
+	streamDepth     int // nesting depth of active streams (incremented on StreamStarted, decremented on StreamStopped)
+	streamStartTime time.Time
 
 	// Track whether we've received content from an assistant response
 	// Used by --exit-after-response to ensure we don't exit before receiving content
@@ -160,6 +161,9 @@ type chatPage struct {
 
 	app *app.App
 
+	// Command parser for handling slash commands in the editor
+	commandParser *commands.Parser
+
 	// Sidebar drag state
 	isDraggingSidebar     bool // True while dragging the sidebar resize handle
 	sidebarDragStartX     int  // X position when drag started
@@ -170,6 +174,16 @@ type chatPage struct {
 // computeSidebarLayout calculates the layout based on current state.
 func (p *chatPage) computeSidebarLayout() sidebarLayout {
 	innerWidth := p.width - appPaddingHorizontal
+
+	// Lean mode: no sidebar at all
+	if p.leanMode {
+		return sidebarLayout{
+			mode:       sidebarCollapsedNarrow,
+			innerWidth: innerWidth,
+			chatWidth:  innerWidth,
+			chatHeight: max(1, p.height),
+		}
+	}
 
 	var mode sidebarLayoutMode
 	switch {
@@ -241,72 +255,39 @@ func defaultKeyMap() KeyMap {
 	}
 }
 
-// getEditorDisplayNameFromEnv returns a friendly display name for the configured editor.
-// It takes visual and editorEnv values as parameters and maps common editors to display names.
-// If neither is set, it returns the platform-specific fallback that will actually be used.
-func getEditorDisplayNameFromEnv(visual, editorEnv string) string {
-	editorCmd := cmp.Or(visual, editorEnv)
-	if editorCmd == "" {
-		if goruntime.GOOS == "windows" {
-			return "Notepad"
-		}
-		return "Vi"
-	}
-
-	parts := strings.Fields(editorCmd)
-	if len(parts) == 0 {
-		return "$EDITOR"
-	}
-
-	baseName := filepath.Base(parts[0])
-
-	editorPrefixes := []struct {
-		prefix string
-		name   string
-	}{
-		{"code", "VSCode"},
-		{"cursor", "Cursor"},
-		{"nvim", "Neovim"},
-		{"vim", "Vim"},
-		{"vi", "Vi"},
-		{"nano", "Nano"},
-		{"emacs", "Emacs"},
-		{"subl", "Sublime Text"},
-		{"sublime", "Sublime Text"},
-		{"atom", "Atom"},
-		{"gedit", "gedit"},
-		{"kate", "Kate"},
-		{"notepad++", "Notepad++"},
-		{"notepad", "Notepad"},
-		{"textmate", "TextMate"},
-		{"mate", "TextMate"},
-		{"zed", "Zed"},
-	}
-
-	for _, e := range editorPrefixes {
-		if strings.HasPrefix(baseName, e.prefix) {
-			return e.name
-		}
-	}
-
-	if baseName != "" {
-		return strings.ToUpper(baseName[:1]) + baseName[1:]
-	}
-
-	return "$EDITOR"
-}
-
 // New creates a new chat page
-func New(a *app.App, sessionState *service.SessionState) Page {
+func New(a *app.App, sessionState *service.SessionState, opts ...PageOption) Page {
 	p := &chatPage{
-		sidebar:      sidebar.New(sessionState),
-		messages:     messages.New(sessionState),
-		app:          a,
-		keyMap:       defaultKeyMap(),
-		sessionState: sessionState,
+		sidebar:       sidebar.New(sessionState),
+		messages:      messages.New(sessionState),
+		app:           a,
+		keyMap:        defaultKeyMap(),
+		commandParser: commands.NewParser(),
+		sessionState:  sessionState,
+	}
+
+	for _, opt := range opts {
+		opt(p)
 	}
 
 	return p
+}
+
+// PageOption configures a chat page.
+type PageOption func(*chatPage)
+
+// WithLeanMode creates a lean chat page with no sidebar.
+func WithLeanMode() PageOption {
+	return func(p *chatPage) {
+		p.leanMode = true
+	}
+}
+
+// WithCommandParser injects a command parser for handling slash commands in the editor.
+func WithCommandParser(p *commands.Parser) PageOption {
+	return func(cp *chatPage) {
+		cp.commandParser = p
+	}
 }
 
 // Init initializes the chat page
@@ -515,19 +496,26 @@ func (p *chatPage) View() string {
 		bodyContent = lipgloss.JoinHorizontal(lipgloss.Left, chatView, toggleCol, sidebarView)
 
 	case sidebarCollapsed, sidebarCollapsedNarrow:
-		sidebarRendered := p.renderCollapsedSidebar(sl)
-
-		chatView := styles.ChatStyle.
-			Height(sl.chatHeight).
-			Width(sl.innerWidth).
-			Render(messagesView)
-
-		bodyContent = lipgloss.JoinVertical(lipgloss.Top, sidebarRendered, chatView)
+		if p.leanMode {
+			// Lean mode: no sidebar header, no fixed height
+			bodyContent = styles.ChatStyle.
+				Width(sl.innerWidth).
+				Render(messagesView)
+		} else {
+			sidebarRendered := p.renderCollapsedSidebar(sl)
+			chatView := styles.ChatStyle.
+				Height(sl.chatHeight).
+				Width(sl.innerWidth).
+				Render(messagesView)
+			bodyContent = lipgloss.JoinVertical(lipgloss.Top, sidebarRendered, chatView)
+		}
 	}
 
-	return styles.AppStyle.
-		Height(p.height).
-		Render(bodyContent)
+	appStyle := styles.AppStyle
+	if !p.leanMode {
+		appStyle = appStyle.Height(p.height)
+	}
+	return appStyle.Render(bodyContent)
 }
 
 // renderSidebarHandle renders the sidebar toggle/resize handle.
@@ -608,9 +596,8 @@ func (p *chatPage) cancelStream(showCancelMessage bool) tea.Cmd {
 	p.msgCancel()
 	p.msgCancel = nil
 	p.streamCancelled = true
+	p.streamDepth = 0
 	p.setPendingResponse(false)
-	p.stopProgressBar()
-
 	// Send StreamCancelledMsg to all components to handle cleanup
 	return tea.Batch(
 		core.CmdHandler(msgtypes.StreamCancelledMsg{ShowMessage: showCancelMessage}),
@@ -621,10 +608,17 @@ func (p *chatPage) cancelStream(showCancelMessage bool) tea.Cmd {
 // handleSendMsg handles incoming messages from the editor, either processing
 // them immediately or queuing them if the agent is busy.
 func (p *chatPage) handleSendMsg(msg msgtypes.SendMsg) (layout.Model, tea.Cmd) {
+	// Handle "exit", "quit", and ":q" as special keywords to quit the session
+	// immediately, equivalent to the /exit slash command.
+	switch strings.TrimSpace(msg.Content) {
+	case "exit", "quit", ":q":
+		return p, core.CmdHandler(msgtypes.ExitSessionMsg{})
+	}
+
 	// Predefined slash commands (e.g., /yolo, /exit, /compact) execute immediately
 	// even while the agent is working - they're UI commands that don't interrupt the stream.
 	// Custom agent commands (defined in config) should still be queued.
-	if commands.ParseSlashCommand(msg.Content) != nil {
+	if p.commandParser.Parse(msg.Content) != nil {
 		cmd := p.processMessage(msg)
 		return p, cmd
 	}
@@ -832,13 +826,15 @@ func (p *chatPage) syncQueueToSidebar() {
 func (p *chatPage) processMessage(msg msgtypes.SendMsg) tea.Cmd {
 	// Handle slash commands (e.g., /eval, /compact, /exit) BEFORE cancelling any ongoing stream.
 	// These are UI commands that shouldn't interrupt the running agent.
-	if cmd := commands.ParseSlashCommand(msg.Content); cmd != nil {
+	if cmd := p.commandParser.Parse(msg.Content); cmd != nil {
 		return cmd
 	}
 
 	if p.msgCancel != nil {
 		p.msgCancel()
 	}
+
+	p.streamDepth = 0
 
 	var ctx context.Context
 	ctx, p.msgCancel = context.WithCancel(context.Background())
@@ -851,8 +847,6 @@ func (p *chatPage) processMessage(msg msgtypes.SendMsg) tea.Cmd {
 	// Start working state immediately to show the user something is happening.
 	// This provides visual feedback while the runtime loads tools and prepares the stream.
 	spinnerCmd := p.setWorking(true)
-	p.startProgressBar()
-
 	// Check if this is an agent command that needs resolution
 	// If so, show a loading message with the command description
 	var loadingCmd tea.Cmd
@@ -889,11 +883,6 @@ func (p *chatPage) CompactSession(additionalPrompt string) tea.Cmd {
 	)
 }
 
-func (p *chatPage) Cleanup() {
-	p.stopProgressBar()
-	p.sidebar.Cleanup()
-}
-
 // SetSessionStarred updates the sidebar star indicator
 func (p *chatPage) SetSessionStarred(starred bool) {
 	p.sidebar.SetSessionStarred(starred)
@@ -918,8 +907,8 @@ func (p *chatPage) SetSidebarSettings(settings SidebarSettings) {
 }
 
 // handleSidebarClickType checks what was clicked in the sidebar area.
-// Returns the type of click (star, title, or none).
-func (p *chatPage) handleSidebarClickType(x, y int) sidebar.ClickResult {
+// Returns the click type and, for ClickAgent, the agent name.
+func (p *chatPage) handleSidebarClickType(x, y int) (sidebar.ClickResult, string) {
 	adjustedX := x - styles.AppPadding
 	sl := p.computeSidebarLayout()
 
@@ -932,7 +921,7 @@ func (p *chatPage) handleSidebarClickType(x, y int) sidebar.ClickResult {
 		}
 	}
 
-	return sidebar.ClickNone
+	return sidebar.ClickNone, ""
 }
 
 // routeMouseEvent routes mouse events to the appropriate component based on coordinates.
@@ -968,6 +957,11 @@ func (p *chatPage) IsWorking() bool {
 	return p.working
 }
 
+// IsInlineEditing returns true if a past user message is being edited inline.
+func (p *chatPage) IsInlineEditing() bool {
+	return p.messages.IsInlineEditing()
+}
+
 // QueueLength returns the number of queued messages
 func (p *chatPage) QueueLength() int {
 	return len(p.messageQueue)
@@ -991,14 +985,4 @@ func (p *chatPage) BlurMessages() {
 // ScrollToBottom scrolls the messages viewport to the bottom if auto-scroll is active.
 func (p *chatPage) ScrollToBottom() tea.Cmd {
 	return p.messages.ScrollToBottom()
-}
-
-// startProgressBar sets a terminal progress-bar indicator (ConEmu/Windows Terminal).
-// See: https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
-func (p *chatPage) startProgressBar() {
-	fmt.Fprint(os.Stderr, "\x1b]9;4;3;0\x1b\\")
-}
-
-func (p *chatPage) stopProgressBar() {
-	fmt.Fprint(os.Stderr, "\x1b]9;4;0;0\x1b\\")
 }

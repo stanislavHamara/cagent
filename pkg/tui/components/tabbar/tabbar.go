@@ -2,13 +2,15 @@
 package tabbar
 
 import (
+	"strings"
+
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/styles"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 )
 
 const (
@@ -142,6 +144,12 @@ func New(maxTitleLen int) *TabBar {
 		lastEnsuredIdx: noTab,
 		drag:           dragState{dropIdx: noTab},
 	}
+}
+
+// SetCloseTabEnabled enables or disables the close-tab key binding.
+// When disabled, Ctrl+W passes through to the editor for word deletion.
+func (t *TabBar) SetCloseTabEnabled(v bool) {
+	t.keyMap.CloseTab.SetEnabled(v)
 }
 
 // SetWidth sets the available width for the tab bar.
@@ -399,22 +407,26 @@ func (t *TabBar) View() string {
 	needsScroll := totalWidth > availWidth
 
 	if !needsScroll {
-		t.scrollOffset = 0
+		// Reset persistent scroll position once everything fits, so the next
+		// time the bar overflows again the user starts from the leftmost
+		// tab. The mutation lives here, rather than in SetTabs/SetWidth,
+		// because only the rendering pass knows the actual tab widths.
+		t.scrollOffset = 0 //rubocop:disable Lint/TUIViewPurity // intentional reset; see comment above
 	} else if t.activeIdx != t.lastEnsuredIdx {
 		// Only auto-scroll when the active tab changes (e.g. tab switch),
 		// not on every render — otherwise manual scroll via arrows is undone.
 		t.ensureActiveVisible(allTabs, availWidth)
-		t.lastEnsuredIdx = t.activeIdx
+		t.lastEnsuredIdx = t.activeIdx //rubocop:disable Lint/TUIViewPurity // memo to avoid re-running ensureActiveVisible on every render
 	}
 
 	// Compute "+" and arrow colors dynamically from the terminal background.
-	chromeFg := mutedContrastFg(styles.Background)
+	chromeFg := styles.MutedContrastFg(styles.Background)
 	plusStyle := lipgloss.NewStyle().Foreground(chromeFg)
 	arrowStyle := lipgloss.NewStyle().Foreground(chromeFg)
 	// Attention arrow style: warning-colored and bold so off-screen attention tabs are obvious.
-	attnArrowStyle := lipgloss.NewStyle().Foreground(ensureContrast(styles.Warning, styles.Background)).Bold(true)
+	attnArrowStyle := lipgloss.NewStyle().Foreground(styles.EnsureContrast(styles.Warning, styles.Background)).Bold(true)
 
-	var line string
+	var line strings.Builder
 	var cursor int
 
 	// Left scroll arrow — highlight if any off-screen tab to the left needs attention.
@@ -424,7 +436,7 @@ func (t *TabBar) View() string {
 			style = attnArrowStyle
 		}
 		arrow := style.Render(scrollLeftText)
-		line += arrow
+		line.WriteString(arrow)
 		t.zones = append(t.zones, clickZone{
 			startX: cursor, endX: cursor + scrollArrowWidth,
 			tabIdx: noTab, isScrollLeft: true,
@@ -436,7 +448,7 @@ func (t *TabBar) View() string {
 	var dropLine string
 	visualDrop := noTab
 	if t.drag.active && !t.drag.isNoOp() {
-		dropFg := ensureContrast(styles.TabAccentFg, styles.Background)
+		dropFg := styles.EnsureContrast(styles.TabAccentFg, styles.Background)
 		dropLine = lipgloss.NewStyle().Foreground(dropFg).Render(dropIndicator)
 		visualDrop = t.drag.dropIdx
 	}
@@ -475,7 +487,7 @@ func (t *TabBar) View() string {
 
 		// Insert the drop indicator before this tab if this is the visual drop position.
 		if visualDrop == i {
-			line += dropLine
+			line.WriteString(dropLine)
 			cursor += dropIndicatorWidth
 		}
 
@@ -486,14 +498,14 @@ func (t *TabBar) View() string {
 			clickZone{startX: mainEnd, endX: cursor + tabW, tabIdx: i, isClose: true},
 		)
 
-		line += tab.View()
+		line.WriteString(tab.View())
 		cursor += tabW
 		lastVisibleIdx = i
 	}
 
 	// Drop indicator after the last visible tab.
 	if visualDrop == lastVisibleIdx+1 {
-		line += dropLine
+		line.WriteString(dropLine)
 		cursor += dropIndicatorWidth
 	}
 
@@ -504,7 +516,7 @@ func (t *TabBar) View() string {
 			style = attnArrowStyle
 		}
 		arrow := style.Render(scrollRightText)
-		line += arrow
+		line.WriteString(arrow)
 		t.zones = append(t.zones, clickZone{
 			startX: cursor, endX: cursor + scrollArrowWidth,
 			tabIdx: noTab, isScrollRight: true,
@@ -514,13 +526,13 @@ func (t *TabBar) View() string {
 
 	// "+" button.
 	plus := plusStyle.Render(plusButtonText)
-	line += plus
+	line.WriteString(plus)
 	t.zones = append(t.zones, clickZone{
 		startX: cursor, endX: cursor + plusButtonWidth,
 		tabIdx: noTab, isPlus: true,
 	})
 
-	return line
+	return line.String()
 }
 
 // ensureActiveVisible adjusts scrollOffset so the active tab is visible.

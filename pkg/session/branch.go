@@ -1,32 +1,27 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
-	"time"
 
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/chat"
 )
 
 // BranchSession creates a new session branched from the parent at the given position.
 // Messages up to (but not including) branchAtPosition are deep-cloned into the new session.
 func BranchSession(parent *Session, branchAtPosition int) (*Session, error) {
 	if parent == nil {
-		return nil, fmt.Errorf("parent session is nil")
+		return nil, errors.New("parent session is nil")
 	}
-	if branchAtPosition < 0 || branchAtPosition >= len(parent.Messages) {
+	if branchAtPosition < 0 || branchAtPosition > len(parent.Messages) {
 		return nil, fmt.Errorf("branch position %d out of range", branchAtPosition)
 	}
 
 	branched := New()
 	copySessionMetadata(branched, parent, generateBranchTitle(parent.Title))
-
-	now := time.Now()
-	branched.BranchParentSessionID = parent.ID
-	branched.BranchParentPosition = &branchAtPosition
-	branched.BranchCreatedAt = &now
 
 	branched.Messages = make([]Item, 0, branchAtPosition)
 	for i := range branchAtPosition {
@@ -45,7 +40,11 @@ func BranchSession(parent *Session, branchAtPosition int) (*Session, error) {
 func cloneSessionItem(item Item) (Item, error) {
 	switch {
 	case item.Message != nil:
-		return Item{Message: cloneMessage(item.Message)}, nil
+		cloned := cloneMessage(item.Message)
+		// Branched messages must get fresh database IDs when persisted, so
+		// drop the parent's row ID.
+		cloned.ID = 0
+		return Item{Message: cloned}, nil
 	case item.SubSession != nil:
 		clonedSub, err := cloneSubSession(item.SubSession)
 		if err != nil {
@@ -55,7 +54,7 @@ func cloneSessionItem(item Item) (Item, error) {
 	case item.Summary != "":
 		return Item{Summary: item.Summary, Cost: item.Cost}, nil
 	default:
-		return Item{}, fmt.Errorf("cannot clone empty session item")
+		return Item{}, errors.New("cannot clone empty session item")
 	}
 }
 
@@ -87,7 +86,6 @@ func copySessionMetadata(dst, src *Session, title string) {
 	}
 	dst.Title = title
 	dst.ToolsApproved = src.ToolsApproved
-	dst.Thinking = src.Thinking
 	dst.HideToolResults = src.HideToolResults
 	dst.WorkingDir = src.WorkingDir
 	dst.SendUserMessage = src.SendUserMessage
@@ -96,6 +94,7 @@ func copySessionMetadata(dst, src *Session, title string) {
 	dst.Permissions = clonePermissionsConfig(src.Permissions)
 	dst.AgentModelOverrides = cloneStringMap(src.AgentModelOverrides)
 	dst.CustomModelsUsed = cloneStringSlice(src.CustomModelsUsed)
+	dst.AttachedFiles = src.AttachedFilesSnapshot()
 }
 
 // generateBranchTitle creates a title for a branched session based on the parent title.
@@ -124,10 +123,10 @@ func generateBranchTitle(parentTitle string) string {
 	const branchedSuffix = "(branched)"
 	if strings.HasSuffix(parentTitle, branchedSuffix) {
 		baseTitle := strings.TrimRight(parentTitle[:len(parentTitle)-len(branchedSuffix)], " \t")
-		return fmt.Sprintf("%s (branch 2)", baseTitle)
+		return baseTitle + " (branch 2)"
 	}
 
-	return fmt.Sprintf("%s (branched)", parentTitle)
+	return parentTitle + " (branched)"
 }
 
 func clonePermissionsConfig(src *PermissionsConfig) *PermissionsConfig {
@@ -144,66 +143,14 @@ func cloneStringMap(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return nil
 	}
-	dst := make(map[string]string, len(src))
-	maps.Copy(dst, src)
-	return dst
+	return maps.Clone(src)
 }
 
 func cloneStringSlice(src []string) []string {
 	if src == nil {
 		return nil
 	}
-	return append([]string(nil), src...)
-}
-
-func cloneMessage(src *Message) *Message {
-	if src == nil {
-		return nil
-	}
-	msgCopy := *src
-	msgCopy.ID = 0
-	msgCopy.Message = cloneChatMessage(src.Message)
-	return &msgCopy
-}
-
-func cloneChatMessage(src chat.Message) chat.Message {
-	dst := src
-
-	if src.MultiContent != nil {
-		dst.MultiContent = make([]chat.MessagePart, len(src.MultiContent))
-		for i, part := range src.MultiContent {
-			cloned := part
-			if part.ImageURL != nil {
-				imageCopy := *part.ImageURL
-				cloned.ImageURL = &imageCopy
-			}
-			dst.MultiContent[i] = cloned
-		}
-	}
-
-	if src.FunctionCall != nil {
-		fnCopy := *src.FunctionCall
-		dst.FunctionCall = &fnCopy
-	}
-
-	if src.ToolCalls != nil {
-		dst.ToolCalls = append([]tools.ToolCall(nil), src.ToolCalls...)
-	}
-
-	if src.ToolDefinitions != nil {
-		dst.ToolDefinitions = append([]tools.Tool(nil), src.ToolDefinitions...)
-	}
-
-	if src.Usage != nil {
-		usageCopy := *src.Usage
-		dst.Usage = &usageCopy
-	}
-
-	if src.ThoughtSignature != nil {
-		dst.ThoughtSignature = append([]byte(nil), src.ThoughtSignature...)
-	}
-
-	return dst
+	return slices.Clone(src)
 }
 
 func setParentIDs(sess *Session) {

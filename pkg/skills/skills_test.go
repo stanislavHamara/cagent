@@ -93,6 +93,127 @@ Body`,
 			},
 			wantOK: true,
 		},
+		{
+			name: "allowed-tools as comma-separated string",
+			content: `---
+name: csv-skill
+description: Skill with comma-separated allowed tools
+allowed-tools: Read, Grep, Write
+---
+
+Body`,
+			want: Skill{
+				Name:         "csv-skill",
+				Description:  "Skill with comma-separated allowed tools",
+				AllowedTools: []string{"Read", "Grep", "Write"},
+			},
+			wantOK: true,
+		},
+		{
+			name: "allowed-tools as single string without commas",
+			content: `---
+name: single-tool-skill
+description: Skill with a single allowed tool
+allowed-tools: Read
+---
+
+Body`,
+			want: Skill{
+				Name:         "single-tool-skill",
+				Description:  "Skill with a single allowed tool",
+				AllowedTools: []string{"Read"},
+			},
+			wantOK: true,
+		},
+		{
+			name: "context fork",
+			content: `---
+name: forked-skill
+description: A skill that runs as a sub-agent
+context: fork
+---
+
+Body`,
+			want: Skill{
+				Name:        "forked-skill",
+				Description: "A skill that runs as a sub-agent",
+				Context:     "fork",
+			},
+			wantOK: true,
+		},
+		{
+			name: "context fork with allowed-tools",
+			content: `---
+name: scoped-fork
+description: Fork skill with tool restrictions
+context: fork
+allowed-tools: Read, Grep
+---
+
+Body`,
+			want: Skill{
+				Name:         "scoped-fork",
+				Description:  "Fork skill with tool restrictions",
+				Context:      "fork",
+				AllowedTools: []string{"Read", "Grep"},
+			},
+			wantOK: true,
+		},
+		{
+			name: "model override (named)",
+			content: `---
+name: model-skill
+description: A skill that overrides the model
+context: fork
+model: my_fast_model
+---
+
+Body`,
+			want: Skill{
+				Name:        "model-skill",
+				Description: "A skill that overrides the model",
+				Context:     "fork",
+				Model:       "my_fast_model",
+			},
+			wantOK: true,
+		},
+		{
+			name: "model override (inline provider/model)",
+			content: `---
+name: inline-model-skill
+description: Skill with inline provider/model override
+context: fork
+model: openai/gpt-4o-mini
+---
+
+Body`,
+			want: Skill{
+				Name:        "inline-model-skill",
+				Description: "Skill with inline provider/model override",
+				Context:     "fork",
+				Model:       "openai/gpt-4o-mini",
+			},
+			wantOK: true,
+		},
+		{
+			name:    "allowed-tools list with quoted items",
+			content: "---\nname: quoted-tools\ndescription: Skill with quoted tool items\nallowed-tools:\n  - \"Bash(git:*)\"\n  - 'Read'\n---\n\nBody",
+			want: Skill{
+				Name:         "quoted-tools",
+				Description:  "Skill with quoted tool items",
+				AllowedTools: []string{"Bash(git:*)", "Read"},
+			},
+			wantOK: true,
+		},
+		{
+			name:    "colon in description value",
+			content: "---\nname: node-webapp-scaffold\ndescription: scaffold a minimal Node.js project. Usage: run this\n---\n\nBody",
+			want: Skill{
+				Name:        "node-webapp-scaffold",
+				Description: "scaffold a minimal Node.js project. Usage: run this",
+			},
+			wantOK: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -106,6 +227,8 @@ Body`,
 				assert.Equal(t, tt.want.Compatibility, got.Compatibility)
 				assert.Equal(t, tt.want.Metadata, got.Metadata)
 				assert.Equal(t, tt.want.AllowedTools, got.AllowedTools)
+				assert.Equal(t, tt.want.Context, got.Context)
+				assert.Equal(t, tt.want.Model, got.Model)
 			}
 		})
 	}
@@ -161,6 +284,28 @@ Run migrations with care.
 	assert.Equal(t, "Database migration helper", skills[0].Description)
 	assert.Equal(t, filepath.Join(nestedDir, "SKILL.md"), skills[0].FilePath)
 	assert.Equal(t, nestedDir, skills[0].BaseDir)
+}
+
+func TestLoadSkillsFromDir_NameFromDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	skillDir := filepath.Join(tmpDir, "hola")
+	require.NoError(t, os.MkdirAll(skillDir, 0o755))
+
+	// Skill without a name field — should derive name from directory.
+	skillContent := `---
+description: Say hello in Spanish
+---
+
+Run the hola command.
+`
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0o644))
+
+	skills := loadSkillsFromDir(tmpDir, false)
+
+	require.Len(t, skills, 1)
+	assert.Equal(t, "hola", skills[0].Name)
+	assert.Equal(t, "Say hello in Spanish", skills[0].Description)
 }
 
 func TestLoadSkillsFromDir_SkipHiddenAndSymlinks(t *testing.T) {
@@ -353,6 +498,44 @@ description: A flat global agents skill
 	assert.True(t, foundFlat, "Expected to find flat-skill from ~/.agents/skills/flat-skill")
 }
 
+func TestLoadSkillsFromDir_RecursiveSymlinkCycle(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a skill in a subdirectory.
+	skillDir := filepath.Join(tmpDir, "real-skill")
+	require.NoError(t, os.MkdirAll(skillDir, 0o755))
+
+	skillContent := `---
+name: real-skill
+description: A real skill
+---
+
+# Real Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0o644))
+
+	// Create a symlink cycle: tmpDir/real-skill/link -> tmpDir
+	require.NoError(t, os.Symlink(tmpDir, filepath.Join(skillDir, "link")))
+
+	// loadSkillsRecursive must return without looping forever.
+	skills := loadSkillsFromDir(tmpDir, true)
+
+	require.Len(t, skills, 1)
+	assert.Equal(t, "real-skill", skills[0].Name)
+	assert.Equal(t, "A real skill", skills[0].Description)
+}
+
+func TestLoadSkillsFromDir_RecursiveSymlinkSelfReference(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a directory that symlinks to itself.
+	require.NoError(t, os.Symlink(tmpDir, filepath.Join(tmpDir, "self")))
+
+	// Must not loop forever.
+	skills := loadSkillsFromDir(tmpDir, true)
+	assert.Empty(t, skills)
+}
+
 func TestLoad_AgentsSkillsProjectFromNestedDir(t *testing.T) {
 	// Create a fake git repo with .agents/skills at the root
 	tmpRepo := t.TempDir()
@@ -535,6 +718,13 @@ func TestFindGitRoot(t *testing.T) {
 		got := findGitRoot(tmpDir)
 		assert.Empty(t, got)
 	})
+}
+
+func TestSkill_IsFork(t *testing.T) {
+	assert.True(t, (&Skill{Context: "fork"}).IsFork())
+	assert.False(t, (&Skill{Context: ""}).IsFork())
+	assert.False(t, (&Skill{Context: "inline"}).IsFork())
+	assert.False(t, (&Skill{}).IsFork())
 }
 
 func TestProjectSearchDirs(t *testing.T) {

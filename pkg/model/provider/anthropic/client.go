@@ -6,122 +6,49 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 
-	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/config/latest"
-	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/httpclient"
-	"github.com/docker/cagent/pkg/model/provider/base"
-	"github.com/docker/cagent/pkg/model/provider/options"
-	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/httpclient"
+	"github.com/docker/docker-agent/pkg/model/provider/anthropic/federation"
+	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/model/provider/providerutil"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 // Client represents an Anthropic client wrapper implementing provider.Provider
 // It holds the anthropic client and model config
 type Client struct {
 	base.Config
-	clientFn         func(context.Context) (anthropic.Client, error)
-	lastHTTPResponse *http.Response
-	fileManager      *FileManager
-}
 
-func (c *Client) getResponseTrailer() http.Header {
-	if c.lastHTTPResponse == nil {
-		return nil
-	}
-
-	if c.lastHTTPResponse.Body != nil {
-		_, _ = io.Copy(io.Discard, c.lastHTTPResponse.Body)
-	}
-
-	return c.lastHTTPResponse.Trailer
-}
-
-// adjustMaxTokensForThinking checks if max_tokens needs adjustment for thinking_budget.
-// Anthropic's max_tokens represents the combined budget for thinking + output tokens.
-// Returns the adjusted maxTokens value and an error if user-set max_tokens is too low.
-func (c *Client) adjustMaxTokensForThinking(maxTokens int64) (int64, error) {
-	if c.ModelConfig.ThinkingBudget == nil || c.ModelConfig.ThinkingBudget.Tokens <= 0 {
-		return maxTokens, nil
-	}
-
-	thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
-	minRequired := thinkingTokens + 1024 // configured thinking budget + minimum output buffer
-
-	if maxTokens <= thinkingTokens {
-		userSetMaxTokens := c.ModelConfig.MaxTokens != nil
-		if userSetMaxTokens {
-			// User explicitly set max_tokens too low - return error
-			slog.Error("Anthropic: max_tokens must be greater than thinking_budget",
-				"max_tokens", maxTokens,
-				"thinking_budget", thinkingTokens)
-			return 0, fmt.Errorf("anthropic: max_tokens (%d) must be greater than thinking_budget (%d); increase max_tokens to at least %d",
-				maxTokens, thinkingTokens, minRequired)
-		}
-		// Auto-adjust when user didn't set max_tokens
-		slog.Info("Anthropic: auto-adjusting max_tokens to accommodate thinking_budget",
-			"original_max_tokens", maxTokens,
-			"thinking_budget", thinkingTokens,
-			"new_max_tokens", minRequired)
-		// return the configured thinking budget + 8192 because that's the default
-		// max_tokens value for anthropic models when unspecified by the user
-		return thinkingTokens + 8192, nil
-	}
-
-	return maxTokens, nil
-}
-
-// interleavedThinkingEnabled returns false unless explicitly enabled via
-// models:provider_opts:interleaved_thinking: true
-func (c *Client) interleavedThinkingEnabled() bool {
-	// Default to false if not provided
-	if c == nil || len(c.ModelConfig.ProviderOpts) == 0 {
-		return false
-	}
-	v, ok := c.ModelConfig.ProviderOpts["interleaved_thinking"]
-	if !ok {
-		return false
-	}
-	switch t := v.(type) {
-	case bool:
-		return t
-	case string:
-		s := strings.TrimSpace(strings.ToLower(t))
-		return s != "false" && s != "0" && s != "no"
-	case int:
-		return t != 0
-	case int64:
-		return t != 0
-	case float64:
-		return t != 0
-	default:
-		return false
-	}
+	clientFn    func(context.Context) (anthropic.Client, error)
+	fileManager *FileManager
 }
 
 // NewClient creates a new Anthropic client from the provided configuration
 func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider, opts ...options.Opt) (*Client, error) {
 	if cfg == nil {
-		slog.Error("Anthropic client creation failed", "error", "model configuration is required")
+		slog.ErrorContext(ctx, "Anthropic client creation failed", "error", "model configuration is required")
 		return nil, errors.New("model configuration is required")
 	}
 
 	if cfg.Provider != "anthropic" {
-		slog.Error("Anthropic client creation failed", "error", "model type must be 'anthropic'", "actual_type", cfg.Provider)
+		slog.ErrorContext(ctx, "Anthropic client creation failed", "error", "model type must be 'anthropic'", "actual_type", cfg.Provider)
 		return nil, errors.New("model type must be 'anthropic'")
 	}
 
 	if env == nil {
-		slog.Error("Anthropic client creation failed", "error", "environment provider is required")
+		slog.ErrorContext(ctx, "Anthropic client creation failed", "error", "environment provider is required")
 		return nil, errors.New("environment provider is required")
 	}
 
@@ -141,16 +68,14 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	}
 
 	if gateway := globalOptions.Gateway(); gateway == "" {
-		authToken, _ := env.Get(ctx, "ANTHROPIC_API_KEY")
-		if authToken == "" {
-			return nil, errors.New("ANTHROPIC_API_KEY environment variable is required")
+		authOpts, err := buildDirectAuthOptions(ctx, cfg, env)
+		if err != nil {
+			slog.ErrorContext(ctx, "Anthropic client creation failed", "error", err)
+			return nil, err
 		}
-
-		slog.Debug("Anthropic API key found, creating client")
-		requestOptions := []option.RequestOption{
-			option.WithAPIKey(authToken),
-			option.WithHTTPClient(httpclient.NewHTTPClient()),
-		}
+		requestOptions := append([]option.RequestOption{
+			option.WithHTTPClient(httpclient.NewHTTPClient(ctx)),
+		}, authOpts...)
 		if cfg.BaseURL != "" {
 			requestOptions = append(requestOptions, option.WithBaseURL(cfg.BaseURL))
 		}
@@ -159,9 +84,12 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			return client, nil
 		}
 	} else {
+		if cfg.Auth != nil {
+			return nil, errors.New("anthropic: auth and Docker AI Gateway are mutually exclusive")
+		}
 		// Fail fast if Docker Desktop's auth token isn't available
 		if token, _ := env.Get(ctx, environment.DockerDesktopTokenEnv); token == "" {
-			slog.Error("Anthropic client creation failed", "error", "failed to get Docker Desktop's authentication token")
+			slog.ErrorContext(ctx, "Anthropic client creation failed", "error", "failed to get Docker Desktop's authentication token")
 			return nil, errors.New("sorry, you first need to sign in Docker Desktop to use the Docker AI Gateway")
 		}
 
@@ -170,7 +98,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			// Query a fresh auth token each time the client is used
 			authToken, _ := env.Get(ctx, environment.DockerDesktopTokenEnv)
 			if authToken == "" {
-				return anthropic.Client{}, errors.New("failed to get Docker Desktop token for Gateway")
+				return anthropic.Client{}, errors.New(base.NoDesktopTokenErrorMessage)
 			}
 
 			url, err := url.Parse(gateway)
@@ -192,23 +120,51 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			}
 
 			client := anthropic.NewClient(
-				option.WithResponseInto(&anthropicClient.lastHTTPResponse),
 				option.WithAuthToken(authToken),
 				option.WithAPIKey(authToken),
 				option.WithBaseURL(baseURL),
-				option.WithHTTPClient(httpclient.NewHTTPClient(httpOptions...)),
+				option.WithHTTPClient(httpclient.NewHTTPClient(ctx, httpOptions...)),
 			)
 
 			return client, nil
 		}
 	}
 
-	slog.Debug("Anthropic client created successfully", "model", cfg.Model)
+	slog.DebugContext(ctx, "Anthropic client created successfully", "model", cfg.Model)
 
 	// Initialize FileManager for file uploads
 	anthropicClient.fileManager = NewFileManager(anthropicClient.clientFn)
 
 	return anthropicClient, nil
+}
+
+// buildDirectAuthOptions returns the SDK request options that authenticate
+// a direct (non-gateway) Anthropic client. It picks between Workload
+// Identity Federation and the legacy ANTHROPIC_API_KEY path based on cfg.
+func buildDirectAuthOptions(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider) ([]option.RequestOption, error) {
+	if cfg.Auth != nil {
+		if cfg.Auth.Type != latest.AuthTypeWorkloadIdentityFederation {
+			return nil, fmt.Errorf("anthropic: unsupported auth.type %q", cfg.Auth.Type)
+		}
+		// YAML-loaded configs are validated, but a programmatic caller may
+		// pass Auth.Federation == nil; reject explicitly rather than panic.
+		if cfg.Auth.Federation == nil {
+			return nil, errors.New("anthropic: workload_identity_federation block is required when auth.type is workload_identity_federation")
+		}
+		slog.DebugContext(ctx, "Anthropic Workload Identity Federation configured",
+			"federation_rule_id", cfg.Auth.Federation.FederationRuleID)
+		opts, err := federation.RequestOptions(cfg.Auth.Federation, env)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic workload identity federation: %w", err)
+		}
+		return opts, nil
+	}
+	apiKey, _ := env.Get(ctx, "ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return nil, errors.New("ANTHROPIC_API_KEY environment variable is required")
+	}
+	slog.DebugContext(ctx, "Anthropic API key found")
+	return []option.RequestOption{option.WithAPIKey(apiKey)}, nil
 }
 
 // hasFileAttachments checks if any messages contain file attachments.
@@ -230,7 +186,7 @@ func (c *Client) CreateChatCompletionStream(
 	messages []chat.Message,
 	requestTools []tools.Tool,
 ) (chat.MessageStream, error) {
-	slog.Debug("Creating Anthropic chat completion stream",
+	slog.DebugContext(ctx, "Creating Anthropic chat completion stream",
 		"model", c.ModelConfig.Model,
 		"message_count", len(messages),
 		"tool_count", len(requestTools))
@@ -248,38 +204,32 @@ func (c *Client) CreateChatCompletionStream(
 
 	client, err := c.clientFn(ctx)
 	if err != nil {
-		slog.Error("Failed to create Anthropic client", "error", err)
+		slog.ErrorContext(ctx, "Failed to create Anthropic client", "error", err)
 		return nil, err
 	}
 
-	// Use Beta API when:
-	// 1. Interleaved thinking is enabled, or
-	// 2. Structured output is configured, or
-	// 3. Messages contain file attachments (Files API is Beta-only)
-	// Note: Structured outputs require beta header support (only available on BetaMessageNewParams)
-	if c.interleavedThinkingEnabled() || c.ModelOptions.StructuredOutput() != nil || hasFileAttachments(messages) {
+	// Route to the Beta Messages API when any of the following are set:
+	//  - interleaved thinking
+	//  - structured output (requires beta header)
+	//  - file attachments (Files API is Beta-only)
+	//  - task_budget (requires the task-budgets beta header)
+	if c.interleavedThinkingEnabled() ||
+		c.ModelOptions.StructuredOutput() != nil ||
+		hasFileAttachments(messages) ||
+		!c.ModelConfig.TaskBudget.IsZero() {
 		return c.createBetaStream(ctx, client, messages, requestTools, maxTokens)
 	}
 
 	allTools, err := convertTools(requestTools)
 	if err != nil {
-		slog.Error("Failed to convert tools for Anthropic request", "error", err)
+		slog.ErrorContext(ctx, "Failed to convert tools for Anthropic request", "error", err)
 		return nil, err
 	}
 
 	converted, err := c.convertMessages(ctx, messages)
 	if err != nil {
-		slog.Error("Failed to convert messages for Anthropic request", "error", err)
+		slog.ErrorContext(ctx, "Failed to convert messages for Anthropic request", "error", err)
 		return nil, err
-	}
-	// Preflight validation to ensure tool_use/tool_result sequencing is valid
-	if err := validateAnthropicSequencing(converted); err != nil {
-		slog.Warn("Invalid message sequencing for Anthropic detected, attempting self-repair", "error", err)
-		converted = repairAnthropicSequencing(converted)
-		if err2 := validateAnthropicSequencing(converted); err2 != nil {
-			slog.Error("Failed to self-repair Anthropic sequencing", "error", err2)
-			return nil, err
-		}
 	}
 	if len(converted) == 0 {
 		return nil, errors.New("no messages to send after conversion: all messages were filtered out")
@@ -287,7 +237,7 @@ func (c *Client) CreateChatCompletionStream(
 	sys := extractSystemBlocks(messages)
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(c.ModelConfig.Model),
+		Model:     c.ModelConfig.Model,
 		MaxTokens: maxTokens,
 		System:    sys,
 		Messages:  converted,
@@ -295,20 +245,7 @@ func (c *Client) CreateChatCompletionStream(
 	}
 
 	// Apply thinking budget first, as it affects whether we can set temperature
-	thinkingEnabled := false
-	if c.ModelConfig.ThinkingBudget != nil && c.ModelConfig.ThinkingBudget.Tokens > 0 {
-		thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
-		switch {
-		case thinkingTokens >= 1024 && thinkingTokens < maxTokens:
-			params.Thinking = anthropic.ThinkingConfigParamOfEnabled(thinkingTokens)
-			thinkingEnabled = true
-			slog.Debug("Anthropic API using thinking_budget (standard messages)", "budget_tokens", thinkingTokens)
-		case thinkingTokens >= maxTokens:
-			slog.Warn("Anthropic thinking_budget must be less than max_tokens, ignoring", "tokens", thinkingTokens, "max_tokens", maxTokens)
-		default:
-			slog.Warn("Anthropic thinking_budget below minimum (1024), ignoring", "tokens", thinkingTokens)
-		}
-	}
+	thinkingEnabled := c.applyThinkingConfig(&params, maxTokens)
 
 	// Temperature and TopP cannot be set when extended thinking is enabled
 	// (Anthropic requires temperature=1.0 which is the default when thinking is on)
@@ -320,15 +257,21 @@ func (c *Client) CreateChatCompletionStream(
 			params.TopP = param.NewOpt(*c.ModelConfig.TopP)
 		}
 	} else if c.ModelConfig.Temperature != nil || c.ModelConfig.TopP != nil {
-		slog.Debug("Anthropic extended thinking enabled, ignoring temperature/top_p settings")
+		slog.DebugContext(ctx, "Anthropic extended thinking enabled, ignoring temperature/top_p settings")
+	}
+
+	// Forward top_k from provider_opts (Anthropic natively supports it)
+	if topK, ok := providerutil.GetProviderOptInt64(c.ModelConfig.ProviderOpts, "top_k"); ok {
+		params.TopK = param.NewOpt(topK)
+		slog.DebugContext(ctx, "Anthropic provider_opts: set top_k", "value", topK)
 	}
 
 	if len(requestTools) > 0 {
-		slog.Debug("Adding tools to Anthropic request", "tool_count", len(requestTools))
+		slog.DebugContext(ctx, "Adding tools to Anthropic request", "tool_count", len(requestTools))
 	}
 
 	// Log the request details for debugging
-	slog.Debug("Anthropic chat completion stream request",
+	slog.DebugContext(ctx, "Anthropic chat completion stream request",
 		"model", params.Model,
 		"max_tokens", maxTokens,
 		"message_count", len(params.Messages))
@@ -336,9 +279,9 @@ func (c *Client) CreateChatCompletionStream(
 	if slog.Default().Enabled(ctx, slog.LevelDebug) {
 		b, err := json.Marshal(params)
 		if err != nil {
-			slog.Error("Failed to marshal Anthropic request", "error", err)
+			slog.ErrorContext(ctx, "Failed to marshal Anthropic request", "error", err)
 		}
-		slog.Debug("Request", "request", string(b))
+		slog.DebugContext(ctx, "Request", "request", string(b))
 	}
 
 	// Add fine-grained tool streaming beta header
@@ -349,25 +292,31 @@ func (c *Client) CreateChatCompletionStream(
 	ad := c.newStreamAdapter(stream, trackUsage)
 
 	// Set up single retry for context length errors
-	ad.retryFn = func() *streamAdapter {
-		used, err := countAnthropicTokens(ctx, client, anthropic.Model(c.ModelConfig.Model), converted, sys, allTools)
+	ad.retryFn = func() *ssestream.Stream[anthropic.MessageStreamEventUnion] {
+		used, err := countAnthropicTokens(ctx, client, c.ModelConfig.Model, converted, sys, allTools)
 		if err != nil {
-			slog.Warn("Failed to count tokens for retry, skipping", "error", err)
+			slog.WarnContext(ctx, "Failed to count tokens for retry, skipping", "error", err)
 			return nil
 		}
 		newMaxTokens := clampMaxTokens(anthropicContextLimit(c.ModelConfig.Model), used, maxTokens)
 		if newMaxTokens >= maxTokens {
-			slog.Warn("Token count does not require clamping, not retrying")
+			slog.WarnContext(ctx, "Token count does not require clamping, not retrying")
 			return nil
 		}
-		slog.Warn("Retrying with clamped max_tokens after context length error", "original max_tokens", maxTokens, "clamped max_tokens", newMaxTokens, "used tokens", used)
+		slog.WarnContext(ctx, "Retrying with clamped max_tokens after context length error", "original max_tokens", maxTokens, "clamped max_tokens", newMaxTokens, "used tokens", used)
 		retryParams := params
 		retryParams.MaxTokens = newMaxTokens
-		return c.newStreamAdapter(client.Messages.NewStreaming(ctx, retryParams, betaHeader), trackUsage)
+		return client.Messages.NewStreaming(ctx, retryParams, betaHeader)
 	}
 
-	slog.Debug("Anthropic chat completion stream created successfully", "model", c.ModelConfig.Model)
+	slog.DebugContext(ctx, "Anthropic chat completion stream created successfully", "model", c.ModelConfig.Model)
 	return ad, nil
+}
+
+// convertDoc converts a document attachment using the client's model ID
+// and the store initialized at construction time.
+func (c *Client) convertDoc(ctx context.Context, doc chat.Document) ([]anthropic.ContentBlockParamUnion, error) {
+	return convertDocument(ctx, doc, c.ID(), c.ModelOptions.ModelsDevStore())
 }
 
 func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) ([]anthropic.MessageParam, error) {
@@ -393,9 +342,7 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 					anthropicMessages = append(anthropicMessages, anthropic.NewUserMessage(contentBlocks...))
 				}
 			} else {
-				if txt := strings.TrimSpace(msg.Content); txt != "" {
-					anthropicMessages = append(anthropicMessages, anthropic.NewUserMessage(anthropic.NewTextBlock(txt)))
-				}
+				anthropicMessages = append(anthropicMessages, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)))
 			}
 			continue
 		}
@@ -411,9 +358,8 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 
 			if len(msg.ToolCalls) > 0 {
 				blockLen := len(msg.ToolCalls)
-				msgContent := strings.TrimSpace(msg.Content)
 				offset := 0
-				if msgContent != "" {
+				if msg.Content != "" {
 					blockLen++
 				}
 				toolUseBlocks := make([]anthropic.ContentBlockParamUnion, blockLen)
@@ -421,8 +367,8 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 				if len(contentBlocks) > 0 {
 					toolUseBlocks = append(contentBlocks, toolUseBlocks...)
 				}
-				if msgContent != "" {
-					toolUseBlocks[len(contentBlocks)+offset] = anthropic.NewTextBlock(msgContent)
+				if msg.Content != "" {
+					toolUseBlocks[len(contentBlocks)+offset] = anthropic.NewTextBlock(msg.Content)
 					offset = 1
 				}
 				for j, toolCall := range msg.ToolCalls {
@@ -442,8 +388,8 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 				// Mark that we expect the very next message to be the grouped tool_result blocks.
 				pendingAssistantToolUse = true
 			} else {
-				if txt := strings.TrimSpace(msg.Content); txt != "" {
-					contentBlocks = append(contentBlocks, anthropic.NewTextBlock(txt))
+				if msg.Content != "" {
+					contentBlocks = append(contentBlocks, anthropic.NewTextBlock(msg.Content))
 				}
 				if len(contentBlocks) > 0 {
 					anthropicMessages = append(anthropicMessages, anthropic.NewAssistantMessage(contentBlocks...))
@@ -461,7 +407,7 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 			var blocks []anthropic.ContentBlockParamUnion
 			j := i
 			for j < len(messages) && messages[j].Role == chat.MessageRoleTool {
-				tr := anthropic.NewToolResultBlock(messages[j].ToolCallID, strings.TrimSpace(messages[j].Content), messages[j].IsError)
+				tr := convertToolResultBlock(&messages[j])
 				blocks = append(blocks, tr)
 				j++
 			}
@@ -486,18 +432,96 @@ func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) (
 	return anthropicMessages, nil
 }
 
+// convertToolResultBlock converts a tool message to an Anthropic tool_result block.
+// If the message contains image content in MultiContent, the images are included
+// as image blocks within the tool_result.
+func convertToolResultBlock(msg *chat.Message) anthropic.ContentBlockParamUnion {
+	// If there are no images in MultiContent, use the simple text-only format.
+	if !hasImageMultiContent(msg.MultiContent) {
+		// tool_result must be present for every preceding tool_use; we cannot skip
+		// it. Normalize whitespace-only content to empty string rather than skipping.
+		content := msg.Content
+		if strings.TrimSpace(content) == "" {
+			content = ""
+		}
+		return anthropic.NewToolResultBlock(msg.ToolCallID, content, msg.IsError)
+	}
+
+	// Build content blocks with text + images for the tool result.
+	var content []anthropic.ToolResultBlockParamContentUnion
+	for _, part := range msg.MultiContent {
+		switch part.Type {
+		case chat.MessagePartTypeText:
+			content = append(content, anthropic.ToolResultBlockParamContentUnion{
+				OfText: &anthropic.TextBlockParam{Text: part.Text},
+			})
+		case chat.MessagePartTypeImageURL:
+			if part.ImageURL == nil {
+				continue
+			}
+			if strings.HasPrefix(part.ImageURL.URL, "data:") {
+				urlParts := strings.SplitN(part.ImageURL.URL, ",", 2)
+				if len(urlParts) == 2 {
+					mediaType := extractMediaType(urlParts[0])
+					content = append(content, anthropic.ToolResultBlockParamContentUnion{
+						OfImage: &anthropic.ImageBlockParam{
+							Source: anthropic.ImageBlockParamSourceUnion{
+								OfBase64: &anthropic.Base64ImageSourceParam{
+									Data:      urlParts[1],
+									MediaType: anthropic.Base64ImageSourceMediaType(mediaType),
+								},
+							},
+						},
+					})
+				}
+			}
+		}
+	}
+
+	toolBlock := anthropic.ToolResultBlockParam{
+		ToolUseID: msg.ToolCallID,
+		Content:   content,
+		IsError:   anthropic.Bool(msg.IsError),
+	}
+	return anthropic.ContentBlockParamUnion{OfToolResult: &toolBlock}
+}
+
+// hasImageMultiContent returns true if the multi-content parts contain any image content.
+func hasImageMultiContent(parts []chat.MessagePart) bool {
+	for _, part := range parts {
+		if part.Type == chat.MessagePartTypeImageURL && part.ImageURL != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// extractMediaType extracts the media type from a data URL prefix (e.g. "data:image/png;base64").
+func extractMediaType(prefix string) string {
+	switch {
+	case strings.Contains(prefix, "image/jpeg"):
+		return "image/jpeg"
+	case strings.Contains(prefix, "image/png"):
+		return "image/png"
+	case strings.Contains(prefix, "image/gif"):
+		return "image/gif"
+	case strings.Contains(prefix, "image/webp"):
+		return "image/webp"
+	default:
+		return "image/jpeg"
+	}
+}
+
 // convertUserMultiContent converts user message multi-content parts to Anthropic content blocks.
 // It handles text and images (base64 and URL). File uploads are NOT supported in the non-Beta API
 // and will return an error - callers should use hasFileAttachments() to route to the Beta API.
-func (c *Client) convertUserMultiContent(_ context.Context, parts []chat.MessagePart) ([]anthropic.ContentBlockParamUnion, error) {
+func (c *Client) convertUserMultiContent(ctx context.Context, parts []chat.MessagePart) ([]anthropic.ContentBlockParamUnion, error) {
 	contentBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(parts))
 
 	for _, part := range parts {
 		switch part.Type {
 		case chat.MessagePartTypeText:
-			if txt := strings.TrimSpace(part.Text); txt != "" {
-				contentBlocks = append(contentBlocks, anthropic.NewTextBlock(txt))
-			}
+			contentBlocks = append(contentBlocks, anthropic.NewTextBlock(part.Text))
 
 		case chat.MessagePartTypeImageURL:
 			if part.ImageURL == nil {
@@ -507,22 +531,8 @@ func (c *Client) convertUserMultiContent(_ context.Context, parts []chat.Message
 			if strings.HasPrefix(part.ImageURL.URL, "data:") {
 				urlParts := strings.SplitN(part.ImageURL.URL, ",", 2)
 				if len(urlParts) == 2 {
-					mediaTypePart := urlParts[0]
+					mediaType := extractMediaType(urlParts[0])
 					base64Data := urlParts[1]
-
-					var mediaType string
-					switch {
-					case strings.Contains(mediaTypePart, "image/jpeg"):
-						mediaType = "image/jpeg"
-					case strings.Contains(mediaTypePart, "image/png"):
-						mediaType = "image/png"
-					case strings.Contains(mediaTypePart, "image/gif"):
-						mediaType = "image/gif"
-					case strings.Contains(mediaTypePart, "image/webp"):
-						mediaType = "image/webp"
-					default:
-						mediaType = "image/jpeg"
-					}
 
 					contentBlocks = append(contentBlocks, anthropic.NewImageBlock(anthropic.Base64ImageSourceParam{
 						Data:      base64Data,
@@ -546,6 +556,15 @@ func (c *Client) convertUserMultiContent(_ context.Context, parts []chat.Message
 			// Return a clear error if we somehow get here.
 			return nil, fmt.Errorf("file attachments require the Beta API; use hasFileAttachments() to route correctly (path=%q, file_id=%q)",
 				part.File.Path, part.File.FileID)
+
+		case chat.MessagePartTypeDocument:
+			if part.Document != nil {
+				docBlocks, err := c.convertDoc(ctx, *part.Document)
+				if err != nil {
+					return nil, fmt.Errorf("failed to convert document attachment %q: %w", part.Document.Name, err)
+				}
+				contentBlocks = append(contentBlocks, docBlocks...)
+			}
 		}
 	}
 
@@ -608,12 +627,14 @@ func extractSystemBlocks(messages []chat.Message) []anthropic.TextBlockParam {
 				}
 			}
 		} else if txt := strings.TrimSpace(msg.Content); txt != "" {
+			// Trim system-message content: YAML literal blocks (instruction: |) always
+			// append a trailing newline, and we don't want that in API payloads.
 			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
 				Text: txt,
 			})
 		}
 
-		if msg.CacheControl {
+		if msg.CacheControl && len(systemBlocks) > 0 {
 			systemBlocks[len(systemBlocks)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
 		}
 	}
@@ -668,86 +689,6 @@ func (c *Client) FileManager() *FileManager {
 	return c.fileManager
 }
 
-// validateAnthropicSequencing verifies that for every assistant message that includes
-// one or more tool_use blocks, the immediately following message is a user message
-// that includes tool_result blocks for all those tool_use IDs (grouped into that single message).
-func validateAnthropicSequencing(msgs []anthropic.MessageParam) error {
-	// Marshal-based inspection to avoid depending on SDK internals of union types
-	for i := range msgs {
-		m, ok := marshalToMap(msgs[i])
-		if !ok || m["role"] != "assistant" {
-			continue
-		}
-
-		toolUseIDs := collectToolUseIDs(contentArray(m))
-		if len(toolUseIDs) == 0 {
-			continue
-		}
-
-		if i+1 >= len(msgs) {
-			slog.Warn("Anthropic sequencing invalid: assistant tool_use present but no next user tool_result message", "assistant_index", i)
-			return errors.New("assistant tool_use present but no subsequent user message with tool_result blocks")
-		}
-
-		next, ok := marshalToMap(msgs[i+1])
-		if !ok || next["role"] != "user" {
-			slog.Warn("Anthropic sequencing invalid: next message after assistant tool_use is not user", "assistant_index", i, "next_role", next["role"])
-			return errors.New("assistant tool_use must be followed by a user message containing corresponding tool_result blocks")
-		}
-
-		toolResultIDs := collectToolResultIDs(contentArray(next))
-		missing := differenceIDs(toolUseIDs, toolResultIDs)
-		if len(missing) > 0 {
-			slog.Warn("Anthropic sequencing invalid: missing tool_result for tool_use id in next user message", "assistant_index", i, "tool_use_id", missing[0], "missing_count", len(missing))
-			return fmt.Errorf("missing tool_result for tool_use id %s in the next user message", missing[0])
-		}
-	}
-	return nil
-}
-
-// repairAnthropicSequencing inserts a synthetic user message containing tool_result blocks
-// immediately after any assistant message that has tool_use blocks missing a corresponding
-// tool_result in the next user message. This is a best-effort local repair to keep the
-// conversation valid for Anthropic while preserving original messages, to keep the agent loop running.
-func repairAnthropicSequencing(msgs []anthropic.MessageParam) []anthropic.MessageParam {
-	if len(msgs) == 0 {
-		return msgs
-	}
-	repaired := make([]anthropic.MessageParam, 0, len(msgs)+2)
-	for i := range msgs {
-		repaired = append(repaired, msgs[i])
-
-		m, ok := marshalToMap(msgs[i])
-		if !ok || m["role"] != "assistant" {
-			continue
-		}
-
-		toolUseIDs := collectToolUseIDs(contentArray(m))
-		if len(toolUseIDs) == 0 {
-			continue
-		}
-
-		// Remove any IDs that already have results in the next user message
-		if i+1 < len(msgs) {
-			if next, ok := marshalToMap(msgs[i+1]); ok && next["role"] == "user" {
-				toolResultIDs := collectToolResultIDs(contentArray(next))
-				for id := range toolResultIDs {
-					delete(toolUseIDs, id)
-				}
-			}
-		}
-
-		if len(toolUseIDs) > 0 {
-			blocks := make([]anthropic.ContentBlockParamUnion, 0, len(toolUseIDs))
-			for id := range toolUseIDs {
-				blocks = append(blocks, anthropic.NewToolResultBlock(id, "(tool execution failed)", false))
-			}
-			repaired = append(repaired, anthropic.NewUserMessage(blocks...))
-		}
-	}
-	return repaired
-}
-
 // marshalToMap is a helper that converts any value to a map[string]any via JSON marshaling.
 // This is used to inspect SDK union types without depending on their internal structure.
 // It's shared by both standard and Beta API validation/repair code.
@@ -770,47 +711,6 @@ func contentArray(m map[string]any) []any {
 		return a
 	}
 	return nil
-}
-
-func collectToolUseIDs(content []any) map[string]struct{} {
-	ids := make(map[string]struct{})
-	for _, c := range content {
-		if cb, ok := c.(map[string]any); ok {
-			if t, _ := cb["type"].(string); t == "tool_use" {
-				if id, _ := cb["id"].(string); id != "" {
-					ids[id] = struct{}{}
-				}
-			}
-		}
-	}
-	return ids
-}
-
-func collectToolResultIDs(content []any) map[string]struct{} {
-	ids := make(map[string]struct{})
-	for _, c := range content {
-		if cb, ok := c.(map[string]any); ok {
-			if t, _ := cb["type"].(string); t == "tool_result" {
-				if id, _ := cb["tool_use_id"].(string); id != "" {
-					ids[id] = struct{}{}
-				}
-			}
-		}
-	}
-	return ids
-}
-
-func differenceIDs(a, b map[string]struct{}) []string {
-	if len(a) == 0 {
-		return nil
-	}
-	var missing []string
-	for id := range a {
-		if _, ok := b[id]; !ok {
-			missing = append(missing, id)
-		}
-	}
-	return missing
 }
 
 // anthropicContextLimit returns a reasonable default context window for Anthropic models.

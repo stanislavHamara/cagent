@@ -3,14 +3,16 @@ package v5
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/goccy/go-yaml"
 
-	"github.com/docker/cagent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/config/types"
 )
 
 const Version = "5"
@@ -38,7 +40,7 @@ func (c *Agents) UnmarshalYAML(unmarshal func(any) error) error {
 	for _, item := range items {
 		name, ok := item.Key.(string)
 		if !ok {
-			return fmt.Errorf("agent name must be a string")
+			return errors.New("agent name must be a string")
 		}
 
 		valueBytes, err := yaml.Marshal(item.Value)
@@ -59,7 +61,7 @@ func (c *Agents) UnmarshalYAML(unmarshal func(any) error) error {
 	return nil
 }
 
-func (c Agents) MarshalYAML() ([]byte, error) {
+func (c Agents) MarshalYAML() (any, error) {
 	mapSlice := make(yaml.MapSlice, 0, len(c))
 
 	for _, agent := range c {
@@ -69,7 +71,7 @@ func (c Agents) MarshalYAML() ([]byte, error) {
 		})
 	}
 
-	return yaml.Marshal(mapSlice)
+	return mapSlice, nil
 }
 
 func (c *Agents) First() AgentConfig {
@@ -139,7 +141,7 @@ type Duration struct {
 // UnmarshalYAML implements custom unmarshaling for Duration from string format
 func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 	if d == nil {
-		return fmt.Errorf("cannot unmarshal into nil Duration")
+		return errors.New("cannot unmarshal into nil Duration")
 	}
 
 	var s string
@@ -165,17 +167,17 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling for Duration to string format
-func (d Duration) MarshalYAML() ([]byte, error) {
+func (d Duration) MarshalYAML() (any, error) {
 	if d.Duration == 0 {
-		return yaml.Marshal("")
+		return "", nil
 	}
-	return yaml.Marshal(d.String())
+	return d.String(), nil
 }
 
 // UnmarshalJSON implements custom unmarshaling for Duration from string format
 func (d *Duration) UnmarshalJSON(data []byte) error {
 	if d == nil {
-		return fmt.Errorf("cannot unmarshal into nil Duration")
+		return errors.New("cannot unmarshal into nil Duration")
 	}
 
 	var s string
@@ -229,7 +231,7 @@ type AgentConfig struct {
 	AddPromptFiles          []string          `json:"add_prompt_files,omitempty" yaml:"add_prompt_files,omitempty"`
 	Commands                types.Commands    `json:"commands,omitempty"`
 	StructuredOutput        *StructuredOutput `json:"structured_output,omitempty"`
-	Skills                  SkillsConfig      `json:"skills,omitempty"`
+	Skills                  SkillsConfig      `json:"skills,omitempty"` //nolint:modernize // frozen config version
 	Hooks                   *HooksConfig      `json:"hooks,omitempty"`
 }
 
@@ -251,12 +253,7 @@ func (s SkillsConfig) Enabled() bool {
 }
 
 func (s SkillsConfig) HasLocal() bool {
-	for _, src := range s.Sources {
-		if src == SkillSourceLocal {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.Sources, SkillSourceLocal)
 }
 
 func (s SkillsConfig) RemoteURLs() []string {
@@ -282,20 +279,20 @@ func (s *SkillsConfig) UnmarshalYAML(unmarshal func(any) error) error {
 
 	var sources []string
 	if err := unmarshal(&sources); err != nil {
-		return fmt.Errorf("skills must be a boolean or a list of sources")
+		return errors.New("skills must be a boolean or a list of sources")
 	}
 	s.Sources = sources
 	return nil
 }
 
-func (s SkillsConfig) MarshalYAML() ([]byte, error) {
+func (s SkillsConfig) MarshalYAML() (any, error) {
 	if len(s.Sources) == 0 {
-		return yaml.Marshal(false)
+		return false, nil
 	}
 	if len(s.Sources) == 1 && s.Sources[0] == SkillSourceLocal {
-		return yaml.Marshal(true)
+		return true, nil
 	}
-	return yaml.Marshal(s.Sources)
+	return s.Sources, nil
 }
 
 func (s *SkillsConfig) UnmarshalJSON(data []byte) error {
@@ -311,7 +308,7 @@ func (s *SkillsConfig) UnmarshalJSON(data []byte) error {
 
 	var sources []string
 	if err := json.Unmarshal(data, &sources); err != nil {
-		return fmt.Errorf("skills must be a boolean or a list of sources")
+		return errors.New("skills must be a boolean or a list of sources")
 	}
 	s.Sources = sources
 	return nil
@@ -438,11 +435,11 @@ func (f *FlexibleModelConfig) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML outputs shorthand format if only provider/model are set
-func (f FlexibleModelConfig) MarshalYAML() ([]byte, error) {
+func (f FlexibleModelConfig) MarshalYAML() (any, error) {
 	if f.isShorthandOnly() {
-		return yaml.Marshal(f.Provider + "/" + f.Model)
+		return f.Provider + "/" + f.Model, nil
 	}
-	return yaml.Marshal(f.ModelConfig)
+	return f.ModelConfig, nil
 }
 
 // isShorthandOnly returns true if only provider and model are set
@@ -570,6 +567,9 @@ type Toolset struct {
 	// For the `filesystem` tool - VCS integration
 	IgnoreVCS *bool `json:"ignore_vcs,omitempty"`
 
+	// For the `lsp` tool
+	FileTypes []string `json:"file_types,omitempty"`
+
 	// For the `fetch` tool
 	Timeout int `json:"timeout,omitempty"`
 }
@@ -637,15 +637,15 @@ func (d *DeferConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	return nil
 }
 
-func (d DeferConfig) MarshalYAML() ([]byte, error) {
+func (d DeferConfig) MarshalYAML() (any, error) {
 	if d.DeferAll {
-		return yaml.Marshal(true)
+		return true, nil
 	}
 	if len(d.Tools) == 0 {
 		// Return false for empty config - this will be omitted by yaml encoder
-		return yaml.Marshal(false)
+		return false, nil
 	}
-	return yaml.Marshal(d.Tools)
+	return d.Tools, nil
 }
 
 // ThinkingBudget represents reasoning budget configuration.
@@ -678,14 +678,14 @@ func (t *ThinkingBudget) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling to output simple string or int format
-func (t ThinkingBudget) MarshalYAML() ([]byte, error) {
+func (t ThinkingBudget) MarshalYAML() (any, error) {
 	// If Effort string is set (non-empty), marshal as string
 	if t.Effort != "" {
-		return yaml.Marshal(t.Effort)
+		return t.Effort, nil
 	}
 
 	// Otherwise marshal as integer (includes 0, -1, and positive values)
-	return yaml.Marshal(t.Tokens)
+	return t.Tokens, nil
 }
 
 // MarshalJSON implements custom marshaling to output simple string or int format
@@ -826,9 +826,9 @@ func (s *RAGStrategyConfig) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 // MarshalYAML implements custom marshaling to flatten Params into parent level
-func (s RAGStrategyConfig) MarshalYAML() ([]byte, error) {
+func (s RAGStrategyConfig) MarshalYAML() (any, error) {
 	result := s.buildFlattenedMap()
-	return yaml.Marshal(result)
+	return result, nil
 }
 
 // MarshalJSON implements custom marshaling to flatten Params into parent level
@@ -975,7 +975,7 @@ func coerceToInt(v any) int {
 	case int64:
 		return int(val)
 	case uint64:
-		return int(val)
+		return int(val) //nolint:gosec // frozen config: value comes from validated YAML; bounds enforced by schema
 	case float64:
 		return int(val)
 	default:
@@ -998,7 +998,7 @@ func (d *RAGDatabaseConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		return nil
 	}
 
-	return fmt.Errorf("database must be a string path to a sqlite database")
+	return errors.New("database must be a string path to a sqlite database")
 }
 
 // AsString returns the database config as a connection string
@@ -1013,7 +1013,7 @@ func (d *RAGDatabaseConfig) AsString() (string, error) {
 		return str, nil
 	}
 
-	return "", fmt.Errorf("invalid database configuration: expected string path")
+	return "", errors.New("invalid database configuration: expected string path")
 }
 
 // IsEmpty returns true if no database is configured

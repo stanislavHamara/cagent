@@ -16,7 +16,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 
-	"github.com/docker/cagent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/chat"
 )
 
 const (
@@ -211,7 +211,7 @@ func (fm *FileManager) upload(ctx context.Context, filePath, contentHash, mimeTy
 
 	filename := filepath.Base(filePath)
 
-	slog.Debug("Uploading file to Anthropic Files API",
+	slog.DebugContext(ctx, "Uploading file to Anthropic Files API",
 		"filename", filename,
 		"mime_type", mimeType,
 		"size", fileSize)
@@ -237,7 +237,7 @@ func (fm *FileManager) upload(ctx context.Context, filePath, contentHash, mimeTy
 		ContentHash: contentHash,
 	}
 
-	slog.Info("File uploaded to Anthropic",
+	slog.InfoContext(ctx, "File uploaded to Anthropic",
 		"file_id", upload.FileID,
 		"filename", upload.Filename,
 		"size", upload.SizeBytes)
@@ -261,7 +261,7 @@ func (fm *FileManager) Delete(ctx context.Context, fileID string) error {
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
 
-	slog.Debug("Deleted file from Anthropic", "file_id", fileID)
+	slog.DebugContext(ctx, "Deleted file from Anthropic", "file_id", fileID)
 	return nil
 }
 
@@ -283,7 +283,7 @@ func (fm *FileManager) Cleanup(ctx context.Context, ttl time.Duration) error {
 	for key, upload := range fm.uploads {
 		if upload.UploadedAt.Before(cutoff) {
 			if err := fm.deleteUnlocked(ctx, upload.FileID); err != nil {
-				slog.Warn("Failed to delete expired file", "file_id", upload.FileID, "error", err)
+				slog.WarnContext(ctx, "Failed to delete expired file", "file_id", upload.FileID, "error", err)
 				errs = append(errs, err)
 				continue
 			}
@@ -325,7 +325,7 @@ func (fm *FileManager) CleanupAll(ctx context.Context) error {
 
 	for key, upload := range fm.uploads {
 		if err := fm.deleteUnlocked(ctx, upload.FileID); err != nil {
-			slog.Warn("Failed to delete file during cleanup", "file_id", upload.FileID, "error", err)
+			slog.WarnContext(ctx, "Failed to delete file during cleanup", "file_id", upload.FileID, "error", err)
 			errs = append(errs, err)
 			continue
 		}
@@ -366,24 +366,6 @@ func (fm *FileManager) CachedCount() int {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 	return len(fm.uploads)
-}
-
-// hashFile computes the SHA256 hash of a file's contents.
-// Note: This function is only used for testing and legacy code paths.
-// The main GetOrUpload path computes the hash inline to avoid opening the file twice.
-func hashFile(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, file); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // IsImageMime returns true if the MIME type is an image type supported by Anthropic.

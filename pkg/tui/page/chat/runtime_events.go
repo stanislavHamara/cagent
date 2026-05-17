@@ -7,13 +7,16 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/docker/cagent/pkg/runtime"
-	"github.com/docker/cagent/pkg/tui/components/notification"
-	"github.com/docker/cagent/pkg/tui/components/sidebar"
-	"github.com/docker/cagent/pkg/tui/core"
-	"github.com/docker/cagent/pkg/tui/dialog"
-	msgtypes "github.com/docker/cagent/pkg/tui/messages"
-	"github.com/docker/cagent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/sound"
+	"github.com/docker/docker-agent/pkg/tools"
+	"github.com/docker/docker-agent/pkg/tui/components/notification"
+	"github.com/docker/docker-agent/pkg/tui/components/sidebar"
+	"github.com/docker/docker-agent/pkg/tui/core"
+	"github.com/docker/docker-agent/pkg/tui/dialog"
+	msgtypes "github.com/docker/docker-agent/pkg/tui/messages"
+	"github.com/docker/docker-agent/pkg/tui/types"
+	"github.com/docker/docker-agent/pkg/userconfig"
 )
 
 // Runtime Event Handling
@@ -51,6 +54,9 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
 	// ===== Error and Warning Events =====
 	case *runtime.ErrorEvent:
+		if userconfig.Get().GetSound() {
+			sound.Play(sound.Failure)
+		}
 		return true, p.messages.AddErrorMessage(msg.Error)
 
 	case *runtime.WarningEvent:
@@ -115,9 +121,8 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 		return true, nil
 
 	case *runtime.ToolsetInfoEvent:
-		p.sidebar.SetToolsetInfo(msg.AvailableTools, msg.Loading)
 		p.sidebar.SetSkillsInfo(len(p.app.CurrentAgentSkills()))
-		return true, nil
+		return true, p.forwardToSidebar(msg)
 
 	case *runtime.SessionTitleEvent:
 		return true, p.forwardToSidebar(msg)
@@ -164,9 +169,15 @@ func (p *chatPage) handleTokenUsage(msg *runtime.TokenUsageEvent) {
 	p.sidebar.SetTokenUsage(msg)
 	if msg.Usage != nil {
 		if sess := p.app.Session(); sess != nil {
-			// Update session-level token counts (used for context % tracking)
-			sess.InputTokens = msg.Usage.InputTokens
-			sess.OutputTokens = msg.Usage.OutputTokens
+			// Only update the parent session's token counts when the event
+			// belongs to this session. Sub-sessions emit their own
+			// TokenUsageEvents with a different SessionID; writing those
+			// values into the parent would overwrite the parent's own
+			// context-tracking counters.
+			if msg.SessionID == "" || msg.SessionID == sess.ID {
+				sess.InputTokens = msg.Usage.InputTokens
+				sess.OutputTokens = msg.Usage.OutputTokens
+			}
 
 			// Track per-message usage for /cost dialog
 			if msg.Usage.LastMessage != nil {
@@ -184,9 +195,10 @@ func (p *chatPage) handleTokenUsage(msg *runtime.TokenUsageEvent) {
 func (p *chatPage) handleStreamStarted(msg *runtime.StreamStartedEvent) tea.Cmd {
 	slog.Debug("handleStreamStarted called", "agent", msg.AgentName, "session_id", msg.SessionID)
 	p.streamCancelled = false
+	p.streamDepth++
+	p.streamStartTime = time.Now()
 	spinnerCmd := p.setWorking(true)
 	pendingCmd := p.setPendingResponse(true)
-	p.startProgressBar()
 	sidebarCmd := p.forwardToSidebar(msg)
 	return tea.Batch(pendingCmd, spinnerCmd, sidebarCmd)
 }
@@ -214,22 +226,42 @@ func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd 
 	slog.Debug("handleStreamStopped called",
 		"agent", msg.AgentName,
 		"session_id", msg.SessionID,
+		"reason", msg.Reason,
 		"should_exit", p.app.ShouldExitAfterFirstResponse(),
-		"has_content", p.hasReceivedAssistantContent)
-	spinnerCmd := p.setWorking(false)
-	p.setPendingResponse(false)
-	if p.msgCancel != nil {
-		p.msgCancel = nil
+		"has_content", p.hasReceivedAssistantContent,
+		"stream_depth", p.streamDepth)
+
+	if p.streamDepth > 0 {
+		p.streamDepth--
 	}
-	p.streamCancelled = false
-	p.stopProgressBar()
+
 	sidebarCmd := p.forwardToSidebar(msg)
 
-	// Check if there are queued messages to process
+	// Sub-agent stream stopped — the parent is still running, so only
+	// forward to the sidebar and keep the working/cancel state intact.
+	// Without this guard, pressing Esc after a sub-agent completes but
+	// while the parent continues would have no effect.
+	if p.streamDepth > 0 {
+		return tea.Batch(p.messages.ScrollToBottom(), sidebarCmd)
+	}
+
+	// Outermost stream stopped — fully clean up.
+	// Only play the success sound when the stream completed normally.
+	// Errors already trigger a failure sound via ErrorEvent, and
+	// user-initiated cancels don't warrant a chime.
+	if userconfig.Get().GetSound() && isSuccessfulStop(msg.Reason) {
+		duration := time.Since(p.streamStartTime)
+		threshold := time.Duration(userconfig.Get().GetSoundThreshold()) * time.Second
+		if duration >= threshold {
+			sound.Play(sound.Success)
+		}
+	}
+	p.msgCancel = nil
+	p.streamCancelled = false
+	spinnerCmd := p.setWorking(false)
+	p.setPendingResponse(false)
 	queueCmd := p.processNextQueuedMessage()
 
-	// Check if we should exit after this response
-	// Only exit if we've actually received assistant content (not just on any stream stop)
 	var exitCmd tea.Cmd
 	if p.app.ShouldExitAfterFirstResponse() && p.hasReceivedAssistantContent {
 		slog.Debug("Exit after first response triggered, scheduling delayed exit")
@@ -246,7 +278,11 @@ func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd 
 // "pending" indicator (not animated) to show it's receiving data.
 func (p *chatPage) handlePartialToolCall(msg *runtime.PartialToolCallEvent) tea.Cmd {
 	p.setPendingResponse(false)
-	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, msg.ToolDefinition, types.ToolStatusPending)
+	var toolDef tools.Tool
+	if msg.ToolDefinition != nil {
+		toolDef = *msg.ToolDefinition
+	}
+	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, toolDef, types.ToolStatusPending)
 	return tea.Batch(toolCmd, p.messages.ScrollToBottom())
 }
 
@@ -254,7 +290,8 @@ func (p *chatPage) handleToolCallConfirmation(msg *runtime.ToolCallConfirmationE
 	spinnerCmd := p.setWorking(false)
 	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, msg.ToolDefinition, types.ToolStatusConfirmation)
 	dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-		Model: dialog.NewToolConfirmationDialog(msg, p.sessionState),
+		Model:            dialog.NewToolConfirmationDialog(msg, p.sessionState),
+		OriginatingEvent: msg,
 	})
 	return tea.Batch(toolCmd, p.messages.ScrollToBottom(), spinnerCmd, dialogCmd)
 }
@@ -288,7 +325,8 @@ func (p *chatPage) handleToolCallResponse(msg *runtime.ToolCallResponseEvent) te
 func (p *chatPage) handleMaxIterationsReached(msg *runtime.MaxIterationsReachedEvent) tea.Cmd {
 	spinnerCmd := p.setWorking(false)
 	dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-		Model: dialog.NewMaxIterationsDialog(msg.MaxIterations, p.app),
+		Model:            dialog.NewMaxIterationsDialog(msg.MaxIterations, p.app),
+		OriginatingEvent: msg,
 	})
 	return tea.Batch(spinnerCmd, dialogCmd)
 }
@@ -306,7 +344,8 @@ func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent
 				serverURL = url
 			}
 			dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-				Model: dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
+				Model:            dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
+				OriginatingEvent: msg,
 			})
 			return tea.Batch(spinnerCmd, dialogCmd)
 		}
@@ -317,15 +356,30 @@ func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent
 	case "url":
 		// URL-based elicitation - show URL dialog
 		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewURLElicitationDialog(msg.Message, msg.URL),
+			Model:            dialog.NewURLElicitationDialog(msg.Message, msg.URL),
+			OriginatingEvent: msg,
 		})
 		return tea.Batch(spinnerCmd, dialogCmd)
 
 	default:
 		// Form-based elicitation (default) - show form dialog
 		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewElicitationDialog(msg.Message, msg.Schema, msg.Meta),
+			Model:            dialog.NewElicitationDialog(msg.Message, msg.Schema, msg.Meta),
+			OriginatingEvent: msg,
 		})
 		return tea.Batch(spinnerCmd, dialogCmd)
+	}
+}
+
+// isSuccessfulStop returns true when the stream reason indicates a
+// normal completion that warrants the success sound. Empty reason
+// (e.g. cache hits, early exits before a turn runs) is treated as
+// success to preserve backward compatibility.
+func isSuccessfulStop(reason string) bool {
+	switch reason {
+	case "", "normal", "continue", "steered":
+		return true
+	default:
+		return false
 	}
 }
